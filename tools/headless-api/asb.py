@@ -111,7 +111,10 @@ class Client:
     def create(self, **cfg):
         """Create a VM. Config keys: name, osType, imagePath|templateName, ramMb,
         hddGb, cpuCores, gpuMode(0-2), networkMode(0-3), netAdapter, adminUser,
-        adminPass, testMode, sshEnabled, sshDeployKey, isTemplate. sshDeployKey
+        adminPass, testMode, sshEnabled, sshDeployKey, isTemplate, and the guest
+        display mode displayWidth/displayHeight/displayHz (default 1920/1080/60;
+        e.g. 2560/1440/240) plus displayModeList (also advertise the built-in
+        mode table so the guest can pick other modes itself). sshDeployKey
         (requires sshEnabled) deploys the AppSandbox public key so you can SSH in
         with key auth (see key_path()); sshInfo reports keyDeployed + sshState 4
         once it lands. The daemon validates these exactly like the GUI; ramMb is
@@ -122,9 +125,10 @@ class Client:
         return self._req("POST", "/vms", cfg)
 
     def edit(self, name, **fields):
-        """Change config on a STOPPED VM. Honors ramMb/cpuCores/gpuMode/networkMode
-        (same ranges as create); name is fixed at create and any other key is ignored.
-        Returns (status, body) -- 409 if the VM is running."""
+        """Change config on a STOPPED VM. Honors ramMb/cpuCores/gpuMode/networkMode and
+        displayWidth/displayHeight/displayHz/displayModeList (same ranges as create);
+        name is fixed at create and any other key is ignored. Returns (status, body) --
+        409 if the VM is running (use set_display_mode() for a live display change)."""
         if isinstance(fields.get("ramMb"), int):
             fields["ramMb"] -= fields["ramMb"] % 2   # 2 MB-aligned, like the GUI
         return self._req("PUT", "/vms/%s" % name, fields)
@@ -149,6 +153,25 @@ class Client:
         disturb the display. Wait for ready, then call open_display()."""
         return self._req("GET", "/vms/%s/display" % name)[1]
     def display_ready(self, name):  return bool(self.display_status(name).get("ready"))
+    def display_mode(self, name):
+        """The VM's configured guest display mode:
+        {displayWidth, displayHeight, displayHz, displayModeList, applied}."""
+        return self._req("GET", "/vms/%s/display/mode" % name)[1]
+    def set_display_mode(self, name, width=None, height=None, hz=None, mode_list=None):
+        """Set the guest display mode (resolution + refresh rate), e.g.
+        set_display_mode("dev", 2560, 1440, 240). Allowed at ANY time: on a running VM
+        the guest agent reconfigures and restarts the guest display driver (a few
+        seconds of black screen) and the display window follows the new size; on a
+        stopped VM it applies at the next boot. Omitted fields keep their values.
+        Ranges: 640-7680 x 480-4320 (even), 24-500 Hz. mode_list=True also lets the
+        guest choose other modes from its own Display Settings. Returns (status, body);
+        body["applied"] is "live" or "next_boot"."""
+        body = {}
+        if width is not None:     body["displayWidth"] = int(width)
+        if height is not None:    body["displayHeight"] = int(height)
+        if hz is not None:        body["displayHz"] = int(hz)
+        if mode_list is not None: body["displayModeList"] = bool(mode_list)
+        return self._req("PUT", "/vms/%s/display/mode" % name, body)
     def snapshots(self, name):   return self._req("GET", "/vms/%s/snapshots" % name)[1].get("snapshots", [])
     def snapshots_full(self, name): return self._req("GET", "/vms/%s/snapshots" % name)[1]  # incl. "current"
     def snap_take(self, name, snapname=None):

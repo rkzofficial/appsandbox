@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <pwd.h>
 #include <sys/stat.h>
+#include <stdatomic.h>
 #include "../../tools/transport/asb_transport.h"   /* ASB_CH_DISPLAY/INPUT/AUDIO/CLIPBOARD[_READER], AsbCursor, ASB_CURSOR_MAGIC */
 
 /* ---- VDD wire protocol (mirror of tools/vdd/vdd.h + src/backend_win/vm_display_idd.c).
@@ -278,6 +279,9 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 - (void)renderMetal;   /* the view calls this on resize so the frame redraws synchronously while dragging */
 - (uint32_t)frameWidth;
 - (uint32_t)frameHeight;
+- (uint32_t)configuredWidth;    /* VM's configured guest mode (pre-first-frame fallback) */
+- (uint32_t)configuredHeight;
+- (void)frameArrived;           /* display thread -> schedule a coalesced main-thread render */
 - (NSCursor *)currentCursorForScale:(double)scale;
 - (NSCursor *)appliedCursor;
 - (void)sendInput:(uint32_t)type p1:(uint32_t)p1 p2:(uint32_t)p2 p3:(uint32_t)p3;
@@ -291,6 +295,13 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
        advances, so the GPU never races the reader. */
     uint8_t          *_fb;          /* working buffer (reader thread) */
     uint32_t          _fbW, _fbH, _fbStride;
+    uint32_t          _cfgW, _cfgH;            /* VM's configured guest mode (window sizing before frame 1) */
+    uint32_t          _fitW, _fitH;            /* frame size the window was last fitted to */
+    _Atomic int32_t   _renderPending;          /* 1 while a frame-driven renderTick is queued on main */
+    uint32_t          _fpsFrames;              /* delivered-fps meter (display thread) */
+    uint64_t          _fpsTickMs;
+    volatile uint32_t _recvFps;
+    uint64_t          _titleMs;                /* last title refresh (main thread) */
     volatile uint32_t _fbSeq;       /* bumped on each applied frame */
     uint32_t          _renderSeq;   /* last _fbSeq uploaded to the GPU */
     pthread_mutex_t   _fbLock;
@@ -378,9 +389,36 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 - (instancetype)initWithName:(NSString *)name
                    transport:(AsbIvshmemTransport *)transport
 {
+    return [self initWithName:name transport:transport displayWidth:0 displayHeight:0];
+}
+
+/* Content size (points) for a guest frame of w x h pixels: 1:1 in points when it fits the
+   main screen's visible frame, else shrunk (aspect preserved). */
+static NSSize idd_fit_size(uint32_t w, uint32_t h)
+{
+    NSRect vis = [NSScreen mainScreen].visibleFrame;
+    double maxW = vis.size.width  > 0 ? vis.size.width  - 40 : 1280;
+    double maxH = vis.size.height > 0 ? vis.size.height - 60 : 720;
+    double sw = maxW / (double)w, sh = maxH / (double)h;
+    double s = sw < sh ? sw : sh;
+    if (s > 1.0) s = 1.0;
+    NSSize sz = NSMakeSize(floor((double)w * s), floor((double)h * s));
+    if (sz.width < 320) sz.width = 320;
+    if (sz.height < 180) sz.height = 180;
+    return sz;
+}
+
+- (instancetype)initWithName:(NSString *)name
+                   transport:(AsbIvshmemTransport *)transport
+                displayWidth:(int)displayWidth
+               displayHeight:(int)displayHeight
+{
     pthread_once(&g_vkOnce, build_keymap);
 
-    NSRect frame = NSMakeRect(0, 0, 1280, 720);
+    uint32_t cfgW = displayWidth  > 0 ? (uint32_t)displayWidth  : 1920;
+    uint32_t cfgH = displayHeight > 0 ? (uint32_t)displayHeight : 1080;
+    NSSize fit = idd_fit_size(cfgW, cfgH);
+    NSRect frame = NSMakeRect(0, 0, fit.width, fit.height);
     NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                               NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
     NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
@@ -396,6 +434,9 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 
     _name = [name copy];
     _transport = transport;
+    _cfgW = cfgW; _cfgH = cfgH;
+    _fitW = cfgW; _fitH = cfgH;
+    window.contentAspectRatio = NSMakeSize(cfgW, cfgH);   /* keep the guest aspect while resizing */
     _inputFd = -1;
     _displayFd = -1;
     _audioFd = -1;
@@ -464,6 +505,10 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
     _metalLayer.device          = _mtlDev;
     _metalLayer.pixelFormat     = MTLPixelFormatBGRA8Unorm;
     _metalLayer.framebufferOnly = YES;
+    /* Don't gate presents on the host display's vblank: a high-refresh guest stream is shown as
+       fast as it arrives (the host panel still samples at its own rate; this removes the queueing). */
+    _metalLayer.displaySyncEnabled = NO;
+    _metalLayer.maximumDrawableCount = 3;
     _metalLayer.contentsScale   = self.window.backingScaleFactor ?: 1.0;
 }
 
@@ -507,7 +552,12 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
     self.userClosed = NO;
     if (!_threadsStarted) {
         _threadsStarted = YES;
-        self.timer = [NSTimer timerWithTimeInterval:(1.0 / 60.0) repeats:YES block:^(NSTimer *t) {
+        /* Housekeeping tick (coalesced mouse-move flush + cursor mirror + safety redraw). Frames
+           themselves are rendered as they ARRIVE: displayLoop queues renderTick on the main queue
+           per frame (coalesced to one in flight), so a 120/144/240 Hz guest is not throttled to a
+           60 Hz timer; with displaySyncEnabled=NO on the layer the present also doesn't wait for
+           the host monitor's vblank. */
+        self.timer = [NSTimer timerWithTimeInterval:(1.0 / 120.0) repeats:YES block:^(NSTimer *t) {
             (void)t;
             [self renderTick];
         }];
@@ -528,9 +578,44 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 /* Render-timer body (main thread): flush a coalesced move, mirror the guest HW cursor onto the
    macOS cursor, and copy a freshly reconstructed frame into the render buffer + redraw. */
 - (void)renderTick {
+    atomic_store(&_renderPending, 0);
     [self flushMove];
     [self.view updateGuestCursor];
     [self renderMetal];
+    /* First frame at a new guest size: refit the window (once per size) and refresh the title. */
+    uint32_t fw = _fbW, fh = _fbH;
+    if (fw && fh && (fw != _fitW || fh != _fitH)) {
+        _fitW = fw; _fitH = fh;
+        if (!(self.window.styleMask & NSWindowStyleMaskFullScreen) && !self.window.isZoomed) {
+            NSSize fit = idd_fit_size(fw, fh);
+            self.window.contentAspectRatio = NSMakeSize(fw, fh);
+            [self.window setContentSize:fit];
+        }
+    }
+    uint64_t nowMs = (uint64_t)(CFAbsoluteTimeGetCurrent() * 1000.0);
+    if (fw && fh && nowMs - _titleMs >= 500) {
+        _titleMs = nowMs;
+        self.window.title = [NSString stringWithFormat:@"%@ — Display %u×%u @ %u fps", _name, fw, fh, _recvFps];
+    }
+}
+
+/* Called from the display thread after each reconstructed frame: schedule ONE render on the
+   main queue (coalesced), so rendering keeps pace with the guest's frame rate instead of the
+   housekeeping timer. */
+- (void)frameArrived {
+    _fpsFrames++;
+    uint64_t nowMs = (uint64_t)(CFAbsoluteTimeGetCurrent() * 1000.0);
+    if (_fpsTickMs == 0) _fpsTickMs = nowMs;
+    if (nowMs - _fpsTickMs >= 1000) {
+        _recvFps = (uint32_t)((uint64_t)_fpsFrames * 1000 / (nowMs - _fpsTickMs));
+        _fpsFrames = 0; _fpsTickMs = nowMs;
+    }
+    int32_t expected = 0;
+    if (atomic_compare_exchange_strong(&_renderPending, &expected, 1)) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!self->_stop) [self renderTick]; else atomic_store(&self->_renderPending, 0);
+        });
+    }
 }
 
 #pragma mark - GPU render (Metal, main thread)
@@ -626,6 +711,8 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
 
 - (uint32_t)frameWidth  { return _fbW; }
 - (uint32_t)frameHeight { return _fbH; }
+- (uint32_t)configuredWidth  { return _cfgW ? _cfgW : 1920; }
+- (uint32_t)configuredHeight { return _cfgH ? _cfgH : 1080; }
 
 #pragma mark - Cursor access (main thread, render timer)
 
@@ -761,6 +848,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
                 memcpy(_fb, scratch, data_size);
                 _fbSeq++;
                 pthread_mutex_unlock(&_fbLock);
+                [self frameArrived];
             } else {
                 /* Dirty rects: rects[], data_size, then per-rect packed rows. */
                 if (fh.dirty_rect_count > VDD_MAX_DIRTY) break;
@@ -788,6 +876,7 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
                 }
                 _fbSeq++;
                 pthread_mutex_unlock(&_fbLock);
+                [self frameArrived];
             }
         }
 
@@ -1564,8 +1653,8 @@ static CGRect idd_letterbox(double viewW, double viewH, double frameW, double fr
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
     NSRect b = self.bounds;
     if (b.size.width < 1 || b.size.height < 1) return;
-    uint32_t gw = [o frameWidth]  ? [o frameWidth]  : 1920;
-    uint32_t gh = [o frameHeight] ? [o frameHeight] : 1080;
+    uint32_t gw = [o frameWidth]  ? [o frameWidth]  : [o configuredWidth];
+    uint32_t gh = [o frameHeight] ? [o frameHeight] : [o configuredHeight];
     /* Invert the SAME letterbox the renderer uses (mirrors window_to_vm_coords): map the click into the
        letterboxed rect, not the whole view, so the cursor lands on the correct VM pixel and a click in a
        bar clamps to the frame edge (Windows behavior). */

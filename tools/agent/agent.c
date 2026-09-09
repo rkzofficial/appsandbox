@@ -1436,7 +1436,16 @@ emit:
 
 /* ---- Helper: run devcon command and capture stdout ---- */
 
+static BOOL run_devcon_ex(const wchar_t *args, char *output, int output_size, DWORD *out_exit_code,
+                          DWORD timeout_ms);
+
 static BOOL run_devcon(const wchar_t *args, char *output, int output_size, DWORD *out_exit_code)
+{
+    return run_devcon_ex(args, output, output_size, out_exit_code, 2000);
+}
+
+static BOOL run_devcon_ex(const wchar_t *args, char *output, int output_size, DWORD *out_exit_code,
+                          DWORD timeout_ms)
 {
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -1475,8 +1484,8 @@ static BOOL run_devcon(const wchar_t *args, char *output, int output_size, DWORD
     }
     CloseHandle(hWrite);
 
-    /* Wait for devcon to finish (10s max). If it hangs, kill it. */
-    if (WaitForSingleObject(pi.hProcess, 2000) == WAIT_TIMEOUT) {
+    /* Wait for devcon to finish. If it hangs, kill it. */
+    if (WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_TIMEOUT) {
         agent_log("run_devcon: process timed out, killing.");
         TerminateProcess(pi.hProcess, 1);
         WaitForSingleObject(pi.hProcess, 3000);
@@ -1717,6 +1726,114 @@ static void send_reply(AsbConn *s, const char *tag, const char *msg)
     }
 }
 
+/* ---- Display mode: "set_display_mode:<w>x<h>@<hz>:<list>" ----
+ *
+ * The VDD (tools/vdd) reads its monitor mode from
+ * HKLM\SOFTWARE\AppSandbox\Display (Width, Height, RefreshHz, ModeList) when
+ * its device starts. The host sends this command on every agent connect and
+ * whenever the user picks a new mode, so: compare with what is stored, and only
+ * when it differs rewrite the key and restart the VDD device (devcon restart ->
+ * monitor departs and re-arrives at the new mode; DWM re-composes; the VDD's
+ * next frames carry the new size and the host viewer follows). The reply goes
+ * out BEFORE the restart so the host never waits on the multi-second PnP cycle. */
+
+#define DISPLAY_REG_KEY L"SOFTWARE\\AppSandbox\\Display"
+
+static BOOL display_reg_read(DWORD *w, DWORD *h, DWORD *hz, DWORD *list)
+{
+    HKEY key;
+    DWORD type, size, v;
+    BOOL ok = TRUE;
+    *w = *h = *hz = *list = 0;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, DISPLAY_REG_KEY, 0,
+                      KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS)
+        return FALSE;
+#define RD(name, out) \
+    size = sizeof(v); \
+    if (RegQueryValueExW(key, name, NULL, &type, (LPBYTE)&v, &size) == ERROR_SUCCESS && type == REG_DWORD) *(out) = v; \
+    else ok = FALSE;
+    RD(L"Width", w); RD(L"Height", h); RD(L"RefreshHz", hz);
+    size = sizeof(v);
+    if (RegQueryValueExW(key, L"ModeList", NULL, &type, (LPBYTE)&v, &size) == ERROR_SUCCESS && type == REG_DWORD)
+        *list = v;   /* optional */
+#undef RD
+    RegCloseKey(key);
+    return ok;
+}
+
+static BOOL display_reg_write(DWORD w, DWORD h, DWORD hz, DWORD list)
+{
+    HKEY key;
+    BOOL ok;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, DISPLAY_REG_KEY, 0, NULL, 0,
+                        KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &key, NULL) != ERROR_SUCCESS)
+        return FALSE;
+    ok = RegSetValueExW(key, L"Width",     0, REG_DWORD, (const BYTE *)&w,    sizeof(w))    == ERROR_SUCCESS &&
+         RegSetValueExW(key, L"Height",    0, REG_DWORD, (const BYTE *)&h,    sizeof(h))    == ERROR_SUCCESS &&
+         RegSetValueExW(key, L"RefreshHz", 0, REG_DWORD, (const BYTE *)&hz,   sizeof(hz))   == ERROR_SUCCESS &&
+         RegSetValueExW(key, L"ModeList",  0, REG_DWORD, (const BYTE *)&list, sizeof(list)) == ERROR_SUCCESS;
+    RegCloseKey(key);
+    return ok;
+}
+
+static void report_display_mode(AsbConn *client)
+{
+    DWORD w, h, hz, list;
+    char line[96];
+    if (client == NULL) return;
+    if (display_reg_read(&w, &h, &hz, &list))
+        sprintf_s(line, sizeof(line), "display_mode:%lux%lu@%lu:%lu", w, h, hz, list);
+    else
+        sprintf_s(line, sizeof(line), "display_mode:1920x1080@60:0");
+    send_line(client, line);
+}
+
+static void handle_set_display_mode(AsbConn *client, const char *tag, const char *args)
+{
+    unsigned int w = 0, h = 0, hz = 0, list = 0;
+    DWORD cw, ch, chz, clist;
+    char output[4096];
+    DWORD exit_code = 0;
+
+    if (sscanf_s(args, "%ux%u@%u:%u", &w, &h, &hz, &list) < 3 ||
+        w < 640 || w > 7680 || h < 480 || h > 4320 || hz < 24 || hz > 500 ||
+        (w % 2) != 0 || (h % 2) != 0) {
+        send_reply(client, tag, "error:bad_mode");
+        return;
+    }
+    list = list ? 1 : 0;
+
+    if (display_reg_read(&cw, &ch, &chz, &clist) &&
+        cw == w && ch == h && chz == hz && clist == list) {
+        send_reply(client, tag, "ok");    /* already at this mode */
+        return;
+    }
+
+    if (!display_reg_write(w, h, hz, list)) {
+        agent_log("set_display_mode: registry write failed (%lu).", GetLastError());
+        send_reply(client, tag, "error:registry");
+        return;
+    }
+    agent_log("set_display_mode: %ux%u@%u list=%u stored; restarting VDD.", w, h, hz, list);
+
+    /* Reply first: the PnP restart below takes several seconds and the host
+       only needs to know the request was accepted. */
+    send_reply(client, tag, "ok:restarting");
+
+    if (!run_devcon(L"status Root\\AppSandboxVDD", output, sizeof(output), &exit_code) ||
+        strstr(output, "No matching")) {
+        agent_log("set_display_mode: VDD not installed yet; the new mode applies when it is.");
+        report_display_mode(client);
+        return;
+    }
+    if (!run_devcon_ex(L"restart Root\\AppSandboxVDD", output, sizeof(output), &exit_code, 20000))
+        agent_log("set_display_mode: devcon restart failed to launch (%lu).", GetLastError());
+    else
+        agent_log("set_display_mode: devcon restart exit=%lu: %.300s", exit_code, output);
+    report_display_mode(client);
+    report_idd_status(client, 1);
+}
+
 static void handle_idd_connect(AsbConn *client, const char *tag)
 {
     DWORD new_console = WTSGetActiveConsoleSessionId();
@@ -1832,6 +1949,7 @@ static void handle_client(AsbConn *client)
 
     /* Report IDD driver status to host (force: always send on connect so a reconnect re-syncs) */
     report_idd_status(client, 1);
+    report_display_mode(client);
 
     /* Initial device checks */
     ensure_vdd_running();
@@ -2036,6 +2154,9 @@ static void handle_client(AsbConn *client)
         }
         else if (strcmp(cmd, "idd_connect") == 0) {
             handle_idd_connect(client, tag);
+        }
+        else if (strncmp(cmd, "set_display_mode:", 17) == 0) {
+            handle_set_display_mode(client, tag, cmd + 17);
         }
         else {
             REPLY("error:unknown");

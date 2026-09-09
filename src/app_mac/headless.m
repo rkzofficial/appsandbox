@@ -314,6 +314,10 @@ static NSDictionary *vm_status_dict(const AsbVmMac *v) {
         @"cpuCores":        @(v->cpu_cores),
         @"gpuMode":         @(v->gpu_mode),
         @"networkMode":     @(v->network_mode),
+        @"displayWidth":    @(v->display_width  > 0 ? v->display_width  : ASB_DISPLAY_DEFAULT_WIDTH),
+        @"displayHeight":   @(v->display_height > 0 ? v->display_height : ASB_DISPLAY_DEFAULT_HEIGHT),
+        @"displayHz":       @(v->display_hz     > 0 ? v->display_hz     : ASB_DISPLAY_DEFAULT_HZ),
+        @"displayModeList": v->display_mode_list ? @YES : @NO,
         /* Live window state: nil ref or a user-(X)-closed one both read false,
            mirroring the Windows daemon's is_open. */
         @"displayOpen":     (v->display != nil && !v->display.userClosed) ? @YES : @NO,
@@ -706,6 +710,15 @@ static int handle_request(int fd, HttpReq *r) {
             int ram = [b[@"ramMb"] intValue], hdd = [b[@"hddGb"] intValue];
             int cpu = [b[@"cpuCores"] intValue], gpu = [b[@"gpuMode"] intValue];
             int net = [b[@"networkMode"] intValue];
+            int dw = [b[@"displayWidth"] intValue], dh = [b[@"displayHeight"] intValue];
+            int dhz = [b[@"displayHz"] intValue];
+            BOOL dlist = [b[@"displayModeList"] boolValue];
+            if (dw || dh || dhz) {
+                const char *derr = asb_mac_display_mode_validate(
+                    dw ? dw : ASB_DISPLAY_DEFAULT_WIDTH, dh ? dh : ASB_DISPLAY_DEFAULT_HEIGHT,
+                    dhz ? dhz : ASB_DISPLAY_DEFAULT_HZ);
+                if (derr) { send_err(fd, 400, "Bad Request", @"invalid_arg", @(derr)); return 0; }
+            }
             BOOL sshEnabled = [b[@"sshEnabled"] boolValue];
             BOOL sshDeploy  = [b[@"sshDeployKey"] boolValue];
             BOOL testMode   = [b[@"testMode"] boolValue];
@@ -743,7 +756,8 @@ static int handle_request(int fd, HttpReq *r) {
                                            ram, hdd, cpu, gpu, net,
                                            img.length ? img.UTF8String : NULL,
                                            user.UTF8String, pass.UTF8String,
-                                           sshEnabled, sshDeploy, testMode);
+                                           sshEnabled, sshDeploy, testMode,
+                                           dw, dh, dhz, dlist);
                 if (rc != BACKEND_OK)
                     hlog(@"create '%@' failed rc=%d (alert event posted)", name, rc);
             });
@@ -832,10 +846,23 @@ static int handle_request(int fd, HttpReq *r) {
                         return 0;
                     }
                 }
+                if (b[@"displayWidth"] || b[@"displayHeight"] || b[@"displayHz"]) {
+                    __block int cw = 0, ch = 0, chz = 0;
+                    on_main(^{
+                        AsbVmMac *v = asb_mac_vm_find(name.UTF8String);
+                        if (v) { cw = v->display_width; ch = v->display_height; chz = v->display_hz; }
+                    });
+                    const char *derr = asb_mac_display_mode_validate(
+                        b[@"displayWidth"]  ? [b[@"displayWidth"] intValue]  : (cw  ? cw  : ASB_DISPLAY_DEFAULT_WIDTH),
+                        b[@"displayHeight"] ? [b[@"displayHeight"] intValue] : (ch  ? ch  : ASB_DISPLAY_DEFAULT_HEIGHT),
+                        b[@"displayHz"]     ? [b[@"displayHz"] intValue]     : (chz ? chz : ASB_DISPLAY_DEFAULT_HZ));
+                    if (derr) { send_err(fd, 400, "Bad Request", @"invalid_arg", @(derr)); return 0; }
+                }
                 __block int rc = BACKEND_OK;
                 __block NSDictionary *st = nil;
                 on_main(^{
-                    for (NSString *field in @[@"ramMb", @"cpuCores", @"gpuMode", @"networkMode"]) {
+                    for (NSString *field in @[@"ramMb", @"cpuCores", @"gpuMode", @"networkMode",
+                                              @"displayWidth", @"displayHeight", @"displayHz", @"displayModeList"]) {
                         if (!b[field]) continue;
                         NSString *val = [NSString stringWithFormat:@"%d", [b[field] intValue]];
                         int frc = asb_mac_vm_edit(name.UTF8String, field.UTF8String, val.UTF8String);
@@ -907,6 +934,54 @@ static int handle_request(int fd, HttpReq *r) {
             });
             if (!info) send_err(fd, 404, "Not Found", @"not_found", @"no such VM");
             else       send_json(fd, 200, "OK", json_str(info));
+            return 0;
+        }
+
+        /* Live display mode: GET/PUT /v1/vms/{n}/display/mode — allowed while RUNNING
+           (a Windows guest's display driver is reconfigured live; a macOS guest picks the
+           size up at its next start). Mirrors the Windows daemon. */
+        if ([sub isEqualToString:@"display/mode"]) {
+            if (isPUT || isPOST) {
+                NSDictionary *b = parse_body(r);
+                int dw = [b[@"displayWidth"] intValue], dh = [b[@"displayHeight"] intValue];
+                int dhz = [b[@"displayHz"] intValue];
+                int dlist = b[@"displayModeList"] ? ([b[@"displayModeList"] boolValue] ? 1 : 0) : -1;
+                if (!b[@"displayWidth"] && !b[@"displayHeight"] && !b[@"displayHz"] && !b[@"displayModeList"]) {
+                    send_err(fd, 400, "Bad Request", @"invalid_arg",
+                             @"body must set at least one of displayWidth, displayHeight, displayHz, displayModeList");
+                    return 0;
+                }
+                __block int cw = 0, ch = 0, chz = 0;
+                on_main(^{
+                    AsbVmMac *v = asb_mac_vm_find(name.UTF8String);
+                    if (v) { cw = v->display_width; ch = v->display_height; chz = v->display_hz; }
+                });
+                const char *derr = asb_mac_display_mode_validate(
+                    dw ? dw : (cw ? cw : ASB_DISPLAY_DEFAULT_WIDTH),
+                    dh ? dh : (ch ? ch : ASB_DISPLAY_DEFAULT_HEIGHT),
+                    dhz ? dhz : (chz ? chz : ASB_DISPLAY_DEFAULT_HZ));
+                if (derr) { send_err(fd, 400, "Bad Request", @"invalid_arg", @(derr)); return 0; }
+                __block int rc = BACKEND_OK;
+                on_main(^{ rc = asb_mac_vm_set_display(name.UTF8String, dw, dh, dhz, dlist); });
+                if (rc != BACKEND_OK) { send_rc(fd, "displayMode", name, rc); return 0; }
+            } else if (!isGET) {
+                send_err(fd, 405, "Method Not Allowed", @"method",
+                         @"use GET to read the display mode, PUT to change it");
+                return 0;
+            }
+            __block NSDictionary *out = nil;
+            on_main(^{
+                AsbVmMac *v = asb_mac_vm_find(name.UTF8String);
+                if (!v) return;
+                BOOL is_win = (strcasecmp(v->os_type, "Windows") == 0);
+                out = @{ @"displayWidth":    @(v->display_width  > 0 ? v->display_width  : ASB_DISPLAY_DEFAULT_WIDTH),
+                         @"displayHeight":   @(v->display_height > 0 ? v->display_height : ASB_DISPLAY_DEFAULT_HEIGHT),
+                         @"displayHz":       @(v->display_hz     > 0 ? v->display_hz     : ASB_DISPLAY_DEFAULT_HZ),
+                         @"displayModeList": v->display_mode_list ? @YES : @NO,
+                         @"applied":         (is_win && v->running && v->agent_online) ? @"live" : @"next_boot" };
+            });
+            if (!out) send_err(fd, 404, "Not Found", @"not_found", @"no such VM");
+            else      send_json(fd, 200, "OK", json_str(out));
             return 0;
         }
 

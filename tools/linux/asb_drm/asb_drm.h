@@ -36,6 +36,7 @@
 
 #define ASB_MAX_WIDTH         7680
 #define ASB_MAX_HEIGHT        4320
+#define ASB_MAX_REFRESH       500
 
 #define ASB_CURSOR_MAX_W      256
 #define ASB_CURSOR_MAX_H      256

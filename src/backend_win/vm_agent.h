@@ -45,4 +45,11 @@ BOOL vm_agent_shutdown(VmInstance *instance);
 BOOL vm_agent_restart(VmInstance *instance);
 BOOL vm_agent_ping(VmInstance *instance);
 
+/* Format the "set_display_mode:<w>x<h>@<hz>:<list>" agent command for this VM's
+   configured display mode. Sent on every agent connect (idempotent on the guest:
+   it only rewrites its driver config + restarts the display driver when the mode
+   differs) and by asb_vm_set_display for a live change. */
+void vm_agent_display_mode_command(const VmInstance *instance, char *buf, int buf_size);
+#define vm_display_mode_command vm_agent_display_mode_command
+
 #endif /* VM_AGENT_H */

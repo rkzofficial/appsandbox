@@ -201,6 +201,10 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_int(jb, L"gpuMode", v->gpu_mode);
     jb_string(jb, L"gpuName", v->gpu_name);
     jb_int(jb, L"networkMode", v->network_mode);
+    jb_int(jb, L"displayWidth",  v->display_width  > 0 ? v->display_width  : DISPLAY_DEFAULT_WIDTH);
+    jb_int(jb, L"displayHeight", v->display_height > 0 ? v->display_height : DISPLAY_DEFAULT_HEIGHT);
+    jb_int(jb, L"displayHz",     v->display_hz     > 0 ? v->display_hz     : DISPLAY_DEFAULT_HZ);
+    jb_bool(jb, L"displayModeList", v->display_mode_list);
     jb_string(jb, L"netAdapter", v->net_adapter);
     jb_bool(jb, L"isTemplate", v->is_template);
     jb_bool(jb, L"hypervVideoOff", v->hyperv_video_off);
@@ -919,6 +923,10 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"cpuCores", &val)) cfg.cpu_cores = (DWORD)val;
         if (json_get_int(json, L"gpuMode", &val)) cfg.gpu_mode = val;
         if (json_get_int(json, L"networkMode", &val)) cfg.network_mode = val;
+        if (json_get_int(json, L"displayWidth", &val))  cfg.display_width  = val;
+        if (json_get_int(json, L"displayHeight", &val)) cfg.display_height = val;
+        if (json_get_int(json, L"displayHz", &val))     cfg.display_hz     = val;
+        json_get_bool(json, L"displayModeList", &cfg.display_mode_list);
         json_get_bool(json, L"testMode", &cfg.test_mode);
         json_get_bool(json, L"sshEnabled", &cfg.ssh_enabled);
         json_get_bool(json, L"sshDeployKey", &cfg.ssh_deploy_key);
@@ -1047,6 +1055,14 @@ static void on_webview2_message(const wchar_t *json)
             else if (wcscmp(field, L"cpuCores") == 0) asb_vm_set_cpu(vm, (DWORD)_wtoi(value));
             else if (wcscmp(field, L"gpuMode") == 0) asb_vm_set_gpu(vm, _wtoi(value));
             else if (wcscmp(field, L"networkMode") == 0) asb_vm_set_network(vm, _wtoi(value));
+            else if (wcscmp(field, L"displayMode") == 0) {
+                /* "WxH@Hz" (Hz optional), applied live when the VM is running */
+                int w = 0, h = 0, hz = 0;
+                if (swscanf_s(value, L"%dx%d@%d", &w, &h, &hz) >= 2)
+                    asb_vm_set_display(vm, w, h, hz, -1);
+            }
+            else if (wcscmp(field, L"displayModeList") == 0)
+                asb_vm_set_display(vm, 0, 0, 0, _wtoi(value) != 0);
             asb_save();
             send_vm_list();
         }

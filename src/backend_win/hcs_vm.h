@@ -47,7 +47,24 @@ typedef struct {
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
     BOOL    ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
+    int     display_width;           /* guest display mode (0 = default 1920x1080@60) */
+    int     display_height;
+    int     display_hz;
+    BOOL    display_mode_list;       /* TRUE = guest may pick other modes in its Display Settings */
 } VmConfig;
+
+/* Display mode limits shared by the core, the UI validators and the viewer.
+   They mirror the guest drivers (VDD_MIN/MAX_* in tools/vdd/vdd.h, the asb_drm
+   clamps) so a value accepted here is one the guest will actually advertise. */
+#define DISPLAY_MIN_WIDTH     640
+#define DISPLAY_MIN_HEIGHT    480
+#define DISPLAY_MAX_WIDTH     7680
+#define DISPLAY_MAX_HEIGHT    4320
+#define DISPLAY_MIN_HZ        24
+#define DISPLAY_MAX_HZ        500
+#define DISPLAY_DEFAULT_WIDTH  1920
+#define DISPLAY_DEFAULT_HEIGHT 1080
+#define DISPLAY_DEFAULT_HZ     60
 
 /* Runtime state of a VM */
 typedef struct {
@@ -108,6 +125,15 @@ typedef struct {
     BOOL        ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key to the guest */
     volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
     wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
+
+    /* Guest display mode. Pushed to the guest agent on every connect (the
+       agent writes the VDD's registry key / asb_drm modprobe options and
+       restarts the display driver when the value differs), and used by the
+       viewer to size its window before the first frame arrives. */
+    int         display_width;
+    int         display_height;
+    int         display_hz;
+    BOOL        display_mode_list;       /* TRUE = guest Display Settings may pick other modes */
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.

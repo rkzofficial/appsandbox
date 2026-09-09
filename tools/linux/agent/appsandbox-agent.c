@@ -446,6 +446,99 @@ static void send_reply(int fd, const char *tag, const char *msg)
     }
 }
 
+/* ---- Display mode: "set_display_mode:<w>x<h>@<hz>:<list>" ----
+ *
+ * asb_drm takes width/height/refresh as module parameters, seeded from the
+ * options line in /etc/modprobe.d/asb_drm.conf (the host substitutes the VM's
+ * configured mode into that line at image build time). The host re-sends the
+ * mode on every connect and on a user change; here we compare against the
+ * loaded module's parameters (sysfs) and rewrite the options line when they
+ * differ. Reloading a live DRM device under the compositor is not survivable,
+ * so the change takes effect on the next boot: reply "ok:reboot_required" and
+ * let the host/user decide. asb_drm is auto-loaded from the real root via
+ * modules-load.d (it is not part of the initramfs), so the rewritten options
+ * line is what the next boot reads; if the module is ever added to the
+ * initramfs, an `update-initramfs -u` would be needed here as well. */
+
+#define ASB_DRM_MODPROBE_CONF "/etc/modprobe.d/asb_drm.conf"
+
+static int read_uint_file(const char *path, unsigned *out)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int rc = (fscanf(f, "%u", out) == 1) ? 0 : -1;
+    fclose(f);
+    return rc;
+}
+
+/* Current asb_drm mode: loaded module params if present, else the modprobe line. */
+static int current_display_mode(unsigned *w, unsigned *h, unsigned *hz)
+{
+    if (read_uint_file("/sys/module/asb_drm/parameters/width", w) == 0 &&
+        read_uint_file("/sys/module/asb_drm/parameters/height", h) == 0 &&
+        read_uint_file("/sys/module/asb_drm/parameters/refresh", hz) == 0)
+        return 0;
+    FILE *f = fopen(ASB_DRM_MODPROBE_CONF, "r");
+    if (!f) return -1;
+    char line[512];
+    int rc = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "options asb_drm", 15) == 0 &&
+            sscanf(line, "options asb_drm width=%u height=%u refresh=%u", w, h, hz) == 3) {
+            rc = 0;
+            break;
+        }
+    }
+    fclose(f);
+    return rc;
+}
+
+static void report_display_mode(int fd)
+{
+    unsigned w = 1920, h = 1080, hz = 60;
+    char line[96];
+    current_display_mode(&w, &h, &hz);
+    snprintf(line, sizeof(line), "display_mode:%ux%u@%u:0", w, h, hz);
+    send_line(fd, line);
+}
+
+static void handle_set_display_mode(int fd, const char *tag, const char *args)
+{
+    unsigned w = 0, h = 0, hz = 0, list = 0, cw = 0, ch = 0, chz = 0;
+    char cmd[512];
+
+    if (sscanf(args, "%ux%u@%u:%u", &w, &h, &hz, &list) < 3 ||
+        w < 640 || w > 7680 || h < 480 || h > 4320 || hz < 24 || hz > 500 ||
+        (w % 2) || (h % 2)) {
+        send_reply(fd, tag, "error:bad_mode");
+        return;
+    }
+
+    /* Persist for the next boot: rewrite (or append) the options line. */
+    snprintf(cmd, sizeof(cmd),
+        "if grep -q '^options asb_drm ' %s 2>/dev/null; then "
+        "sed -i 's/^options asb_drm .*/options asb_drm width=%u height=%u refresh=%u/' %s; "
+        "else echo 'options asb_drm width=%u height=%u refresh=%u' >> %s; fi",
+        ASB_DRM_MODPROBE_CONF, w, h, hz, ASB_DRM_MODPROBE_CONF,
+        w, h, hz, ASB_DRM_MODPROBE_CONF);
+    if (run_sync(cmd) != 0) {
+        agent_log("set_display_mode: failed to update %s", ASB_DRM_MODPROBE_CONF);
+        send_reply(fd, tag, "error:write_failed");
+        return;
+    }
+
+    if (read_uint_file("/sys/module/asb_drm/parameters/width", &cw) == 0 &&
+        read_uint_file("/sys/module/asb_drm/parameters/height", &ch) == 0 &&
+        read_uint_file("/sys/module/asb_drm/parameters/refresh", &chz) == 0 &&
+        cw == w && ch == h && chz == hz) {
+        send_reply(fd, tag, "ok");    /* the loaded module already runs this mode */
+    } else {
+        agent_log("set_display_mode: %ux%u@%u stored; applies at next boot", w, h, hz);
+        send_reply(fd, tag, "ok:reboot_required");
+    }
+    report_display_mode(fd);
+}
+
 /* ---- Heartbeat thread ---- */
 
 static void *heartbeat_thread(void *arg)
@@ -1062,6 +1155,7 @@ static void handle_client(int fd)
         agent_log("hello: send failed");
         goto out;
     }
+    report_display_mode(fd);
 
     if (pthread_create(&hb, NULL, heartbeat_thread, NULL) != 0) {
         agent_log("heartbeat: pthread_create failed: %s", strerror(errno));
@@ -1117,6 +1211,9 @@ static void handle_client(int fd)
         }
         else if (strncmp(cmd, "ssh_deploy_key ", 15) == 0) {
             send_reply(fd, tag, deploy_ssh_key(cmd + 15) ? "ssh_key_deployed" : "ssh_key_failed");
+        }
+        else if (strncmp(cmd, "set_display_mode:", 17) == 0) {
+            handle_set_display_mode(fd, tag, cmd + 17);
         }
         else if (strcmp(cmd, "idd_connect") == 0) {
             /* Mirror Windows handle_idd_connect (tools/agent/agent.c:1485):

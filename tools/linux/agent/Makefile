@@ -35,8 +35,10 @@ appsandbox-display: appsandbox-display.c
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags libdrm) -o $@ $< \
 	       $(LDFLAGS) $(shell pkg-config --libs libdrm)
 
+# Input daemon reads the committed DRM mode (libdrm) to scale host coordinates.
 appsandbox-input: appsandbox-input.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) $(shell pkg-config --cflags libdrm) -o $@ $< \
+	       $(LDFLAGS) $(shell pkg-config --libs libdrm)
 
 # Audio daemon uses libasound to talk to the kernel snd-aloop driver.
 appsandbox-audio: appsandbox-audio.c

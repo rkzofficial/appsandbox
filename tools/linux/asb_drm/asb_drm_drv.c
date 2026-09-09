@@ -150,7 +150,7 @@ static int asb_probe(struct platform_device *pdev)
 	/* Clamp module params into the supported range. */
 	asb->width   = clamp(width_param,   64u, (unsigned)ASB_MAX_WIDTH);
 	asb->height  = clamp(height_param,  64u, (unsigned)ASB_MAX_HEIGHT);
-	asb->refresh = clamp(refresh_param, 24u, 240u);
+	asb->refresh = clamp(refresh_param, 24u, (unsigned)ASB_MAX_REFRESH);
 
 	ret = asb_mode_config_setup(asb);
 	if (ret) {

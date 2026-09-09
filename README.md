@@ -15,7 +15,7 @@ Windows features:
 - GPU Hardware Video Decoder/Encoder support
 - SSH via Hyper-V socket proxy (no network required)
 - Snapshots
-- Fixed 1080P60 display
+- Configurable display mode per VM: resolution and refresh rate (default 1080p60, up to 4K and 240 Hz+), changeable live from the display window, the VM table or the API
 - Host to client hot-key support
 - Provision and boot with / without internet
 - Supports running Claude Cowork and Docker inside the VM thanks to Nested Virtualization Support
@@ -28,7 +28,7 @@ Mac features:
 - 2 Channel Audio
 - macOS: GPU Acceleration via Paravirtualization with support for Metal, Windows: No GPU Acceleration
 - SSH via virtio-vsock (no network required)
-- Fixed 1080P60 display on Windows 11 guests, Dynamic display sizing on macOS guests
+- Configurable display mode (resolution + refresh rate, default 1080p60) on Windows 11 guests, Dynamic display sizing on macOS guests
 - Provision and boot with / without internet
 - Headless mode: the same scriptable local HTTP/JSON API + Python SDK (`asb.py`) as on Windows, for driving macOS and Windows 11 VMs programmatically
 
@@ -100,7 +100,7 @@ DRM/KMS kernel module (`asb_drm`), Microsoft's WSL2 `dxgkrnl`, and a custom Mesa
 apps are native C / Objective-C with an HTML/JS UI (WebView2 on Windows, WKWebView on macOS).
 
 # Tips:
-[Windows] Enable hotkeys or mute the VM audio: connect to the VM and right-click the connection title bar  
+[Windows] Enable hotkeys, mute the VM audio, or change the guest display mode (resolution / refresh rate): connect to the VM and right-click the connection title bar. The window title shows the delivered frame rate; how close it gets to the configured refresh rate depends on how fast the guest can read frames back from the GPU and copy them to the host (dirty-rect updates are cheap, full-screen 1440p/4K redraws are not).  
 
 [Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well  
 

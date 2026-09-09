@@ -40,8 +40,14 @@
 #define VSOCK_PORT      2
 #define FRAME_MAGIC     0x52465341u   /* 'ASFR' little-endian */
 #define CURSOR_MAGIC    0x52435341u   /* 'ASCR' little-endian */
+/* Capture pacing follows the refresh rate of the mode the compositor committed
+ * on the primary plane's CRTC (asb_drm's module-param refresh, or whatever the
+ * guest picked in Display Settings), re-read whenever the framebuffer changes.
+ * TARGET_FPS is only the fallback when the CRTC can't be queried. Full-frame
+ * BGRA at 2560x1440 is ~14.7 MB, so what the host actually receives at high
+ * rates is bounded by vsock throughput, not by this timer. */
 #define TARGET_FPS      60
-#define FRAME_INTERVAL_NS (1000000000L / TARGET_FPS)
+#define MAX_FPS         500
 
 #define CURSOR_TYPE_MASKED_COLOR  1
 #define CURSOR_TYPE_ALPHA         2
@@ -127,13 +133,33 @@ static ssize_t send_all(int fd, const void *buf, size_t len)
 struct capture_ctx {
     int fd;
     uint32_t fb_id_last;
+    uint32_t crtc_id;    /* CRTC the primary plane scans out from (for the refresh rate) */
     uint32_t width;
     uint32_t height;
     uint32_t stride;
+    uint32_t refresh;    /* vrefresh of the committed CRTC mode, 0 = unknown */
     uint8_t *mem;        /* mmapped framebuffer (read-only) */
     size_t   mem_size;
     int      dma_fd;
 };
+
+/* Refresh rate (Hz) of the mode committed on crtc_id, or 0 if unknown. */
+static uint32_t crtc_refresh(int fd, uint32_t crtc_id)
+{
+    uint32_t hz = 0;
+    if (!crtc_id) return 0;
+    drmModeCrtc *crtc = drmModeGetCrtc(fd, crtc_id);
+    if (!crtc) return 0;
+    if (crtc->mode_valid) {
+        hz = crtc->mode.vrefresh;
+        if (hz == 0 && crtc->mode.htotal && crtc->mode.vtotal)
+            hz = (uint32_t)(((uint64_t)crtc->mode.clock * 1000 + (uint64_t)crtc->mode.htotal * crtc->mode.vtotal / 2)
+                            / ((uint64_t)crtc->mode.htotal * crtc->mode.vtotal));
+    }
+    drmModeFreeCrtc(crtc);
+    if (hz > MAX_FPS) hz = MAX_FPS;
+    return hz;
+}
 
 static void drm_release_fb(struct capture_ctx *c)
 {
@@ -193,7 +219,9 @@ static int drm_acquire_fb(struct capture_ctx *c)
             goto out;
         }
 
-        drmModeFB2 *fb2 = drmModeGetFB2(c->fd, p->fb_id);
+        uint32_t fb_id   = p->fb_id;     /* copy out before the plane is freed */
+        uint32_t crtc_id = p->crtc_id;
+        drmModeFB2 *fb2 = drmModeGetFB2(c->fd, fb_id);
         drmModeFreePlane(p);
         if (!fb2) continue;
 
@@ -223,7 +251,9 @@ static int drm_acquire_fb(struct capture_ctx *c)
         }
 
         drm_release_fb(c);
-        c->fb_id_last = p->fb_id;
+        c->fb_id_last = fb_id;
+        c->crtc_id = crtc_id;
+        c->refresh = crtc_refresh(c->fd, crtc_id);
         c->width  = width;
         c->height = height;
         c->stride = pitch;
@@ -661,7 +691,8 @@ have_card:
             }
         } else {
             if (last_status != 1) {
-                agent_log("capturing %ux%u stride=%u", ctx.width, ctx.height, ctx.stride);
+                agent_log("capturing %ux%u stride=%u @ %u Hz", ctx.width, ctx.height, ctx.stride,
+                          ctx.refresh ? ctx.refresh : TARGET_FPS);
                 last_status = 1;
             }
             if (send_frame(client_fd, &ctx, ++seq) < 0) {
@@ -677,8 +708,9 @@ have_card:
             break;
         }
 
-        /* Pace to TARGET_FPS using absolute wakeup. */
-        next.tv_nsec += FRAME_INTERVAL_NS;
+        /* Pace to the committed mode's refresh rate (fallback TARGET_FPS) using
+         * an absolute wakeup. */
+        next.tv_nsec += 1000000000L / (long)(ctx.refresh ? ctx.refresh : TARGET_FPS);
         while (next.tv_nsec >= 1000000000L) {
             next.tv_nsec -= 1000000000L;
             next.tv_sec  += 1;

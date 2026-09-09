@@ -27,7 +27,8 @@
  * 4 KiB page; regions start at 0x10000. Sizes leave headroom over each region's slot stride. */
 #define ASB_FRAME_REGION_OFF    0x10000ull
 #define ASB_FRAME_REGION_SIZE   (48ull * 1024 * 1024)
-#define ASB_DISPLAY_RING_CAP    0x1000000u            /* 16 MiB g2h (a full 1080p frame + headers) */
+#define ASB_DISPLAY_RING_CAP    0x2000000u            /* 32 MiB g2h: two 1440p frames / one 4K frame + headers
+                                                          (was 16 MiB, sized for 1080p). Power of two. */
 #define ASB_DISPLAY_H2G_CAP     4096u                 /* h2g unused for the display stream */
 
 #define ASB_INPUT_REGION_OFF    (ASB_FRAME_REGION_OFF + ASB_FRAME_REGION_SIZE)

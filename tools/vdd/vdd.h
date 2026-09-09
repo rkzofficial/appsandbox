@@ -6,11 +6,17 @@ Module Name:
 
 Abstract:
 
-    AppSandbox Virtual Display Driver - Single 1920x1080 monitor with
-    direct HvSocket frame transport to the host (no agent middleman).
+    AppSandbox Virtual Display Driver - single virtual monitor with direct
+    HvSocket frame transport to the host (no agent middleman).
 
-    Single fixed-resolution monitor with framebuffer readback sent directly
-    over Hyper-V sockets.
+    The monitor's mode (resolution + refresh rate) is configurable: the driver
+    reads HKLM\SOFTWARE\AppSandbox\Display at device add (Width, Height,
+    RefreshHz, ModeList) and defaults to 1920x1080 @ 60 Hz when the key is
+    absent. The host writes that key through the guest agent and restarts the
+    device, so a mode change never needs a driver rebuild. Framebuffer
+    readback is sent to the host over the transport with the frame's real
+    width/height/stride in every header, so the host adapts to whatever mode
+    the guest is running.
 
 Environment:
 
@@ -38,12 +44,43 @@ Environment:
 /* ============================================================================
  *  Display constants
  * ============================================================================ */
-#define VDD_WIDTH            1920
-#define VDD_HEIGHT           1080
+#define VDD_DEFAULT_WIDTH    1920       /* used when the registry key is absent/invalid */
+#define VDD_DEFAULT_HEIGHT   1080
+#define VDD_DEFAULT_REFRESH  60
 #define VDD_BPP              4          /* BGRA 8-bit */
-#define VDD_STRIDE           (VDD_WIDTH * VDD_BPP)
-#define VDD_PIXEL_BYTES      (VDD_STRIDE * VDD_HEIGHT)
 #define VDD_MAX_DIRTY_RECTS  64
+
+/* Sanity limits for a configured mode. The host viewer refuses frames larger
+   than 7680x4320; refresh is bounded so hSync/pixelRate stay sane for IddCx. */
+#define VDD_MIN_WIDTH        640
+#define VDD_MIN_HEIGHT       480
+#define VDD_MAX_WIDTH        7680
+#define VDD_MAX_HEIGHT       4320
+#define VDD_MIN_REFRESH      24
+#define VDD_MAX_REFRESH      500
+#define VDD_MAX_MODES        96         /* configured mode + built-in table (9 x 7 = 63) with headroom */
+
+/* Registry configuration (written by the guest agent on the host's behalf):
+ *   HKLM\SOFTWARE\AppSandbox\Display
+ *     Width      REG_DWORD   active width in pixels
+ *     Height     REG_DWORD   active height in pixels
+ *     RefreshHz  REG_DWORD   vertical refresh in Hz
+ *     ModeList   REG_DWORD   0 = advertise ONLY the configured mode (host has
+ *                            full control; the guest cannot pick another mode)
+ *                            1 = also advertise the built-in mode table so the
+ *                            guest's Display Settings offers other choices
+ *                            (the configured mode stays the preferred one). */
+#define VDD_REG_KEY          L"SOFTWARE\\AppSandbox\\Display"
+#define VDD_REG_WIDTH        L"Width"
+#define VDD_REG_HEIGHT       L"Height"
+#define VDD_REG_REFRESH      L"RefreshHz"
+#define VDD_REG_MODELIST     L"ModeList"
+
+typedef struct _VDD_MODE {
+    UINT width;
+    UINT height;
+    UINT refresh;               /* Hz (integer) */
+} VDD_MODE;
 
 /* ============================================================================
  *  Wire protocol: ASFR frame header (sent over HvSocket to host)
@@ -83,35 +120,30 @@ typedef struct _VDD_WIRE_CURSOR_HEADER {
 #pragma pack(pop)
 
 /* ============================================================================
- *  Supported resolutions and refresh rates (single mode for this driver)
+ *  Built-in mode table (advertised when ModeList=1, in addition to the
+ *  configured mode). Any resolution x any refresh rate below.
  * ============================================================================ */
-struct ResolutionEntry {
-    UINT width;
-    UINT height;
+static const VDD_MODE g_BuiltinResolutions[] = {
+    { 1280,  720, 0 },
+    { 1600,  900, 0 },
+    { 1920, 1080, 0 },
+    { 1920, 1200, 0 },
+    { 2560, 1080, 0 },
+    { 2560, 1440, 0 },
+    { 2560, 1600, 0 },
+    { 3440, 1440, 0 },
+    { 3840, 2160, 0 },
 };
-
-static const ResolutionEntry g_SupportedResolutions[] = {
-    { 1920, 1080 },
-};
-
-static const UINT g_NumResolutions = ARRAYSIZE(g_SupportedResolutions);
-
-struct RefreshRateEntry {
-    UINT numerator;
-    UINT denominator;
-};
-
-static const RefreshRateEntry g_SupportedRefreshRates[] = {
-    { 60, 1 },
-};
-
-static const UINT g_NumRefreshRates = ARRAYSIZE(g_SupportedRefreshRates);
+static const UINT g_BuiltinRefreshRates[] = { 60, 75, 100, 120, 144, 165, 240 };
 
 /* ============================================================================
  *  EDID - 128-byte block
  *
  *  Manufacturer: "ASB" (AppSandBox)
- *  Descriptor:   1920x1080 @ 60 Hz, 8-bit
+ *  Descriptor:   1920x1080 @ 60 Hz, 8-bit (descriptive only: with an EDID
+ *                monitor description IddCx asks the driver for the mode list
+ *                via ParseMonitorDescription, which returns the configured
+ *                modes, so the DTD does not constrain the active mode).
  *  Checksum byte 127 is a placeholder - patched at runtime.
  * ============================================================================ */
 static const BYTE VDD_EDID[] = {
@@ -159,9 +191,10 @@ static const BYTE VDD_EDID[] = {
     0x00, 0x00, 0x00, 0xFC, 0x00,
     'A', 'p', 'p', 'S', 'a', 'n', 'd', 'b', 'o', 'x', 'V', 'D', 'D',
 
-    /* Descriptor #3: Monitor range limits */
+    /* Descriptor #3: Monitor range limits: V 24-240 Hz, H 15-255 kHz,
+       max pixel clock 2550 MHz (wide enough for 4K @ 240 Hz) */
     0x00, 0x00, 0x00, 0xFD, 0x00,
-    0x38, 0x4C, 0x1E, 0x51, 0x11, 0x00, 0x0A,
+    0x18, 0xF0, 0x0F, 0xFF, 0xFF, 0x00, 0x0A,
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
 
     /* Descriptor #4: Dummy (zero) */
@@ -191,8 +224,13 @@ typedef struct _VDD_SWAP_PROC {
     ID3D11Device*       pDevice;
     ID3D11DeviceContext* pDeviceContext;
 
-    /* Staging texture for CPU readback (owned, per-swap-chain) */
+    /* Staging texture for CPU readback (owned, per-swap-chain). Created from the
+       first acquired surface's size and recreated whenever the surface size
+       changes (a guest mode switch hands us a new swap chain of a new size). */
     ID3D11Texture2D*    pStagingTex;
+    UINT                width;              /* current frame size (pixels) */
+    UINT                height;
+    UINT                stride;             /* bytes per row on the wire (width * 4) */
 
     /* Host connection via asb_transport — AF_HYPERV HvSocket on a Windows host, ivshmem stream
        slot on a macOS host. One emit path, two backends. */
@@ -226,9 +264,11 @@ typedef struct _VDD_DEVICE_CONTEXT {
     ID3D11DeviceContext* pCachedCtx;
     LUID                cachedDeviceLuid;
 
-    /* Monitor mode list */
-    DISPLAYCONFIG_VIDEO_SIGNAL_INFO modes[2]; /* 1920x1080@60 (monitor + target) */
+    /* Monitor mode list: the configured mode (index preferredMode) and, when
+       ModeList=1, the built-in table. Read once at device add. */
+    VDD_MODE            modes[VDD_MAX_MODES];
     UINT                modeCount;
+    UINT                preferredMode;
 
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,
        depart and re-arrive the monitor to force DWM re-engagement.

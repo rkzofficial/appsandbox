@@ -100,6 +100,28 @@ static void post_list_changed(void) {
     post_event(CORE_VM_EVENT_LIST_CHANGED, NULL, 0, NULL);
 }
 
+/* Fill unset (0) display-mode fields with the defaults: 1920x1080@60 for a
+   Windows guest (the VDD's historical fixed mode); 2560x1600 for a macOS guest
+   (the VZ display config this app has always used -- VZ has no refresh rate, the
+   Hz field is kept only for uniformity). */
+static void display_mode_defaults_os(const char *os_type, int *w, int *h, int *hz) {
+    BOOL is_mac = (os_type && strcasecmp(os_type, "macOS") == 0);
+    if (*w  <= 0) *w  = is_mac ? 2560 : ASB_DISPLAY_DEFAULT_WIDTH;
+    if (*h  <= 0) *h  = is_mac ? 1600 : ASB_DISPLAY_DEFAULT_HEIGHT;
+    if (*hz <= 0) *hz = ASB_DISPLAY_DEFAULT_HZ;
+}
+static void display_mode_defaults(int *w, int *h, int *hz) {
+    display_mode_defaults_os("Windows", w, h, hz);
+}
+
+/* "set_display_mode:<w>x<h>@<hz>:<list>" for the VM at idx (see tools/agent). */
+static NSString *display_mode_command(int idx) {
+    int w = g_vms[idx].display_width, h = g_vms[idx].display_height, hz = g_vms[idx].display_hz;
+    display_mode_defaults(&w, &h, &hz);
+    return [NSString stringWithFormat:@"set_display_mode:%dx%d@%d:%d", w, h, hz,
+            g_vms[idx].display_mode_list ? 1 : 0];
+}
+
 static int vm_index_of(const char *name) {
     if (!name) return -1;
     for (int i = 0; i < g_vm_count; i++) {
@@ -193,6 +215,11 @@ static void save_vm_list(void) {
         fprintf(f, "CpuCores=%d\n", g_vms[i].cpu_cores);
         fprintf(f, "GpuMode=%d\n", g_vms[i].gpu_mode);
         fprintf(f, "NetworkMode=%d\n", g_vms[i].network_mode);
+        fprintf(f, "DisplayWidth=%d\n", g_vms[i].display_width);
+        fprintf(f, "DisplayHeight=%d\n", g_vms[i].display_height);
+        fprintf(f, "DisplayHz=%d\n", g_vms[i].display_hz);
+        if (g_vms[i].display_mode_list)
+            fprintf(f, "DisplayModeList=1\n");
         if (g_vms[i].test_mode)
             fprintf(f, "TestMode=1\n");
         if (g_vms[i].admin_user[0])
@@ -269,6 +296,14 @@ static void load_vm_list(void) {
             vm->gpu_mode = atoi(line + 8);
         else if (strncmp(line, "NetworkMode=", 12) == 0)
             vm->network_mode = atoi(line + 12);
+        else if (strncmp(line, "DisplayWidth=", 13) == 0)
+            vm->display_width = atoi(line + 13);
+        else if (strncmp(line, "DisplayHeight=", 14) == 0)
+            vm->display_height = atoi(line + 14);
+        else if (strncmp(line, "DisplayHz=", 10) == 0)
+            vm->display_hz = atoi(line + 10);
+        else if (strncmp(line, "DisplayModeList=", 16) == 0)
+            vm->display_mode_list = (atoi(line + 16) != 0);
         else if (strncmp(line, "TestMode=", 9) == 0)
             vm->test_mode = (atoi(line + 9) != 0);
         else if (strncmp(line, "AdminUser=", 10) == 0)
@@ -294,6 +329,12 @@ static void load_vm_list(void) {
     }
 
     fclose(f);
+
+    /* VMs saved before the display setting existed: per-OS defaults (Windows 1080p60,
+       macOS 2560x1600) so nothing changes for an existing VM. */
+    for (int i = 0; i < g_vm_count; i++)
+        display_mode_defaults_os(g_vms[i].os_type, &g_vms[i].display_width,
+                                 &g_vms[i].display_height, &g_vms[i].display_hz);
 }
 
 /* ---- Public: init/cleanup ---- */
@@ -490,7 +531,9 @@ static void open_idd_display_for(int idx) {
     AsbIvshmemTransport *t = g_transport_refs[idx];
     if (!t) return;
     NSString *nsName = [NSString stringWithUTF8String:g_vms[idx].name];
-    IddDisplayWindow *display = [[IddDisplayWindow alloc] initWithName:nsName transport:t];
+    IddDisplayWindow *display = [[IddDisplayWindow alloc] initWithName:nsName transport:t
+                                                          displayWidth:g_vms[idx].display_width
+                                                         displayHeight:g_vms[idx].display_height];
     g_display_refs[idx] = display;
     g_vms[idx].display = (VzDisplayWindow *)display;   /* API-compatible surface (window/userClosed/showDisplay) */
     [display showDisplay];
@@ -528,6 +571,7 @@ static void start_agent_for(int idx) {
         agent = [[VmAgentMac alloc] initWithName:nsName socketDevice:vsock];
     }
     agent.sshEnabled = g_vms[idx].ssh_enabled;
+    agent.displayModeCommand = display_mode_command(idx);
     agent.onOnlineChange = ^(BOOL online) {
         int i = vm_index_of(nsName.UTF8String);
         if (i < 0) return;
@@ -1021,8 +1065,15 @@ int asb_mac_vm_create(const char *name, const char *os_type,
                        const char *admin_pass,
                        BOOL ssh_enabled,
                        BOOL ssh_deploy_key,
-                       BOOL test_mode) {
+                       BOOL test_mode,
+                       int display_width, int display_height, int display_hz,
+                       BOOL display_mode_list) {
     if (!name || !os_type) return BACKEND_ERR_INVALID_ARG;
+    display_mode_defaults_os(os_type, &display_width, &display_height, &display_hz);
+    if (asb_mac_display_mode_validate(display_width, display_height, display_hz)) {
+        post_alert(name, "Invalid display mode %dx%d@%d", display_width, display_height, display_hz);
+        return BACKEND_ERR_INVALID_ARG;
+    }
     if (vm_index_of(name) >= 0) {
         post_alert(name, "A VM named '%s' already exists", name);
         return BACKEND_ERR_INVALID_ARG;
@@ -1056,6 +1107,10 @@ int asb_mac_vm_create(const char *name, const char *os_type,
     vm->cpu_cores = cpu_cores > 0 ? cpu_cores : 4;
     vm->gpu_mode = gpu_mode;
     vm->network_mode = network_mode;
+    vm->display_width  = display_width;
+    vm->display_height = display_height;
+    vm->display_hz     = display_hz;
+    vm->display_mode_list = display_mode_list;
     vm->test_mode = test_mode;   /* honored at start (Windows guest); not forced */
     strlcpy(vm->admin_user,
             (admin_user && admin_user[0]) ? admin_user : "user",
@@ -1223,6 +1278,8 @@ int asb_mac_vm_start(const char *name) {
     VzVm *vm = [VzVm loadVmNamed:nsName
                             ramMb:g_vms[idx].ram_mb
                          cpuCores:g_vms[idx].cpu_cores
+                     displayWidth:g_vms[idx].display_width
+                    displayHeight:g_vms[idx].display_height
                             error:&err];
     if (!vm) {
         post_log("[%s] Load failed: %s", name,
@@ -1332,7 +1389,9 @@ int asb_mac_open_display(const char *name) {
             return BACKEND_OK;
         }
         NSString *nsName = [NSString stringWithUTF8String:name];
-        IddDisplayWindow *display = [[IddDisplayWindow alloc] initWithName:nsName transport:t];
+        IddDisplayWindow *display = [[IddDisplayWindow alloc] initWithName:nsName transport:t
+                                                              displayWidth:g_vms[idx].display_width
+                                                             displayHeight:g_vms[idx].display_height];
         g_display_refs[idx] = display;
         g_vms[idx].display  = (VzDisplayWindow *)display;
         [display showDisplay];
@@ -1570,11 +1629,76 @@ int asb_mac_vm_edit(const char *name, const char *field, const char *value) {
         g_vms[idx].gpu_mode = atoi(value);
     } else if (strcmp(field, "networkMode") == 0) {
         g_vms[idx].network_mode = atoi(value);
+    } else if (strcmp(field, "displayWidth") == 0) {
+        return asb_mac_vm_set_display(name, atoi(value), 0, 0, -1);
+    } else if (strcmp(field, "displayHeight") == 0) {
+        return asb_mac_vm_set_display(name, 0, atoi(value), 0, -1);
+    } else if (strcmp(field, "displayHz") == 0) {
+        return asb_mac_vm_set_display(name, 0, 0, atoi(value), -1);
+    } else if (strcmp(field, "displayMode") == 0) {        /* "WxH@Hz" from the web table */
+        int w = 0, h = 0, hz = 0;
+        if (sscanf(value, "%dx%d@%d", &w, &h, &hz) < 2) return BACKEND_ERR_INVALID_ARG;
+        return asb_mac_vm_set_display(name, w, h, hz, -1);
+    } else if (strcmp(field, "displayModeList") == 0) {
+        return asb_mac_vm_set_display(name, 0, 0, 0, atoi(value) != 0);
     } else {
         return BACKEND_ERR_INVALID_ARG;
     }
 
     save_vm_list();
+    post_event(CORE_VM_EVENT_STATE_CHANGED, g_vms[idx].name, 0, NULL);
+    post_list_changed();
+    return BACKEND_OK;
+}
+
+const char *asb_mac_display_mode_validate(int width, int height, int hz) {
+    if (width < ASB_DISPLAY_MIN_WIDTH || width > ASB_DISPLAY_MAX_WIDTH)
+        return "displayWidth must be between 640 and 7680 pixels.";
+    if (height < ASB_DISPLAY_MIN_HEIGHT || height > ASB_DISPLAY_MAX_HEIGHT)
+        return "displayHeight must be between 480 and 4320 pixels.";
+    if ((width % 2) != 0 || (height % 2) != 0)
+        return "displayWidth and displayHeight must be even.";
+    if (hz < ASB_DISPLAY_MIN_HZ || hz > ASB_DISPLAY_MAX_HZ)
+        return "displayHz must be between 24 and 500 Hz.";
+    return NULL;
+}
+
+int asb_mac_vm_set_display(const char *name, int width, int height, int hz, int mode_list) {
+    if (!name) return BACKEND_ERR_INVALID_ARG;
+    int idx = vm_index_of(name);
+    if (idx < 0) return BACKEND_ERR_NOT_FOUND;
+    if (width == 0)  width  = g_vms[idx].display_width;
+    if (height == 0) height = g_vms[idx].display_height;
+    if (hz == 0)     hz     = g_vms[idx].display_hz;
+    display_mode_defaults_os(g_vms[idx].os_type, &width, &height, &hz);
+    if (asb_mac_display_mode_validate(width, height, hz)) return BACKEND_ERR_INVALID_ARG;
+
+    g_vms[idx].display_width  = width;
+    g_vms[idx].display_height = height;
+    g_vms[idx].display_hz     = hz;
+    if (mode_list >= 0) g_vms[idx].display_mode_list = mode_list ? YES : NO;
+    save_vm_list();
+    post_log("[%s] Display mode: %dx%d @ %d Hz%s", g_vms[idx].name, width, height, hz,
+             g_vms[idx].display_mode_list ? " (+ mode list)" : "");
+
+    /* Live apply for a running Windows guest: the agent rewrites the VDD's registry
+       mode and restarts the driver; the IDD window follows the next frame header.
+       Fire-and-forget off the main thread (the restart takes seconds). */
+    if (vm_is_windows_idx(idx) && g_vms[idx].running && g_vms[idx].agent_online) {
+        VmAgentMac *agent = g_agent_refs[idx];
+        NSString *cmd = display_mode_command(idx);
+        NSString *vmName = [NSString stringWithUTF8String:g_vms[idx].name];   /* block-safe copy */
+        if (agent) {
+            agent.displayModeCommand = cmd;   /* re-sent on every reconnect too */
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                NSString *rsp = [agent sendCommand:cmd timeout:5.0];
+                run_on_main(^{
+                    post_log("[%s] set_display_mode -> %s", vmName.UTF8String, rsp ? rsp.UTF8String : "(no reply)");
+                });
+            });
+        }
+    }
+
     post_event(CORE_VM_EVENT_STATE_CHANGED, g_vms[idx].name, 0, NULL);
     post_list_changed();
     return BACKEND_OK;

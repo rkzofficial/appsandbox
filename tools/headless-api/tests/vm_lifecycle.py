@@ -243,7 +243,8 @@ def run_vm_lifecycle(spec):
 
         # --- config applied at start: edit each field while stopped, then ONE boot
         #     to online to confirm all are reflected on the running VM. ---
-        fields = [("ramMb", ram + 2000), ("cpuCores", 1 if cores != 1 else 2), ("gpuMode", 0), ("networkMode", 0)]
+        fields = [("ramMb", ram + 2000), ("cpuCores", 1 if cores != 1 else 2), ("gpuMode", 0), ("networkMode", 0),
+                  ("displayWidth", 2560), ("displayHeight", 1440), ("displayHz", 120)]
         for field, val in fields:
             check("edit %s=%s (stopped) -> 200" % (field, val), c.edit(name, **{field: val})[0] == 200)
             check("%s persisted = %s" % (field, val), st()[field] == val, "got=%s" % st()[field])
@@ -255,6 +256,12 @@ def run_vm_lifecycle(spec):
         # --- edit-validation rejections (stopped) ---
         check("edit odd RAM -> 400", c._req("PUT", "/vms/" + name, {"ramMb": 4001})[0] == 400)
         check("edit gpuMode=9 -> 400", c._req("PUT", "/vms/" + name, {"gpuMode": 9})[0] == 400)
+        check("edit displayHz=1000 -> 400", c._req("PUT", "/vms/" + name, {"displayHz": 1000})[0] == 400)
+        check("edit odd displayWidth -> 400", c._req("PUT", "/vms/" + name, {"displayWidth": 2561})[0] == 400)
+        # live display-mode route is allowed on a stopped VM too (applies at next boot)
+        code, body = c.set_display_mode(name, 1920, 1080, 60)
+        check("set_display_mode (stopped) -> 200 next_boot", code == 200 and body.get("applied") == "next_boot", "%s %s" % (code, body))
+        check("display_mode reports 1080p60", c.display_mode(name).get("displayHz") == 60)
 
         # --- snapshots + branches (Windows-only; capability-gated). Validate the
         #     on-disk artifacts, not just the API list: the base disk and a

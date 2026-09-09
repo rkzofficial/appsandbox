@@ -45,7 +45,11 @@ static const GUID INPUT_SERVICE_GUID =
 #define DEFAULT_WIDTH       1920
 #define DEFAULT_HEIGHT      1080
 #define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+/* Hard ceiling on one frame payload (8K BGRA); the receive buffer starts at
+   1080p and grows on demand so any guest mode the VDD advertises is accepted. */
+#define MAX_FRAME_WIDTH     7680
+#define MAX_FRAME_HEIGHT    4320
+#define MAX_FRAME_DATA_SIZE (MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 4)
 
 /* ---- Input protocol ---- */
 
@@ -207,11 +211,14 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
     AsbDisplay *d = (AsbDisplay *)param;
     WSADATA wsa;
     BYTE *recv_buf = NULL;
+    SIZE_T recv_cap = (SIZE_T)DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;
     SOCKET input_s = INVALID_SOCKET;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MAX_FRAME_DATA_SIZE);
+    /* Sized for 1080p up front; grown on demand (up to MAX_FRAME_DATA_SIZE) when
+       the guest runs a larger mode. */
+    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, recv_cap);
     if (!recv_buf) return 1;
 
     while (!d->stop) {
@@ -307,6 +314,12 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
                 break;
 
             if (data_size > MAX_FRAME_DATA_SIZE) break;
+            if ((SIZE_T)data_size > recv_cap) {
+                BYTE *nb = (BYTE *)HeapReAlloc(GetProcessHeap(), 0, recv_buf, data_size);
+                if (!nb) break;
+                recv_buf = nb;
+                recv_cap = data_size;
+            }
 
             if (data_size > 0) {
                 if (!recv_exact(s, recv_buf, (int)data_size))

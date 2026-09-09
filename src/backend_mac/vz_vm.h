@@ -28,6 +28,17 @@ void vz_vm_set_no_audio(BOOL no_audio);
                       cpuCores:(int)cpuCores
                          error:(NSError **)error;
 
+/* Same, with the initial guest display size in pixels (the core passes the VM's
+ * configured mode, defaulting to 2560x1600 for macOS guests; 0 = that default).
+ * VZVirtualMachineView.automaticallyReconfiguresDisplay then follows the window,
+ * so this is the mode the guest boots with. VZ exposes no refresh rate. */
++ (nullable VzVm *)loadVmNamed:(NSString *)name
+                         ramMb:(int)ramMb
+                      cpuCores:(int)cpuCores
+                  displayWidth:(int)displayWidth
+                 displayHeight:(int)displayHeight
+                         error:(NSError **)error;
+
 /* Build a fresh configuration for install (no disks are loaded from disk.img;
  * this is used by vz_install during VZMacOSInstaller setup). */
 + (nullable VZVirtualMachineConfiguration *)buildInstallConfigurationForName:(NSString *)name

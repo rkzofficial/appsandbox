@@ -51,6 +51,12 @@ typedef struct {
     char    ssh_pubkey[512];        /* AppSandbox public-key line to deploy (ed25519) */
     int     install_progress;
     char    install_status[128];
+    int     display_width;          /* guest display mode (0 = default 1920x1080@60). Windows guest:
+                                       pushed to the agent (VDD registry) on connect + live change;
+                                       macOS guest: initial VZ display size (refresh not applicable). */
+    int     display_height;
+    int     display_hz;
+    BOOL    display_mode_list;      /* Windows guest: also advertise the built-in mode table */
     VzVm            *__unsafe_unretained vz_handle;
     VzDisplayWindow *__unsafe_unretained display;
     VmAgentMac      *__unsafe_unretained agent;
@@ -72,11 +78,34 @@ int  asb_mac_vm_create(const char *name, const char *os_type,
                         const char *admin_pass,
                         BOOL ssh_enabled,
                         BOOL ssh_deploy_key,
-                        BOOL test_mode);
+                        BOOL test_mode,
+                        int display_width, int display_height, int display_hz,
+                        BOOL display_mode_list);
 int  asb_mac_vm_start(const char *name);
 int  asb_mac_vm_stop(const char *name, int force);
 int  asb_mac_vm_delete(const char *name);
 int  asb_mac_vm_edit(const char *name, const char *field, const char *value);
+
+/* Display mode limits (mirror the guest drivers). */
+#define ASB_DISPLAY_MIN_WIDTH   640
+#define ASB_DISPLAY_MIN_HEIGHT  480
+#define ASB_DISPLAY_MAX_WIDTH   7680
+#define ASB_DISPLAY_MAX_HEIGHT  4320
+#define ASB_DISPLAY_MIN_HZ      24
+#define ASB_DISPLAY_MAX_HZ      500
+#define ASB_DISPLAY_DEFAULT_WIDTH  1920
+#define ASB_DISPLAY_DEFAULT_HEIGHT 1080
+#define ASB_DISPLAY_DEFAULT_HZ     60
+
+/* NULL if the mode is valid, else an English reason. */
+const char *asb_mac_display_mode_validate(int width, int height, int hz);
+
+/* Set the guest display mode. Allowed while RUNNING (unlike asb_mac_vm_edit):
+ * persisted, and for a running Windows guest pushed to the agent, which restarts
+ * the guest display driver at the new mode (the IDD window follows the next
+ * frame). A macOS guest picks the size up at its next start (VZ has no
+ * refresh-rate concept). 0 keeps a field; mode_list < 0 keeps the flag. */
+int  asb_mac_vm_set_display(const char *name, int width, int height, int hz, int mode_list);
 
 void asb_mac_save(void);
 

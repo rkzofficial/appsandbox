@@ -268,6 +268,10 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
             PostMessageW(g_agent_hwnd, WM_VM_HYPERV_VIDEO_OFF, 0, (LPARAM)vm);
     } else if (strncmp(buf, "displays:", 9) == 0) {
         ui_log(L"[%s] Displays: %S", vm->name, buf + 9);
+    } else if (strncmp(buf, "display_mode:", 13) == 0) {
+        /* Guest reports the display driver's active configuration
+           ("display_mode:<w>x<h>@<hz>:<list>") after a mode change. */
+        ui_log(L"[%s] Display mode: %S", vm->name, buf + 13);
     } else if (strncmp(buf, "log:", 4) == 0) {
         ui_log(L"[%s] %S", vm->name, buf + 4);
     } else if (strcmp(buf, "gpu_query") == 0) {
@@ -408,6 +412,18 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd, buf, sizeof(buf));
             if (n <= 0) goto disconnected;
             ui_log(L"NAT IP config for \"%s\": %S", vm->name, buf);
+        }
+
+        /* Sync the guest display mode with the VM's setting. The agent compares
+           against the display driver's stored config and only rewrites + restarts
+           the driver when it differs, so on a normal boot this is a no-op. Tagged
+           so a stale/unknown-command reply from an old agent is consumed here. */
+        {
+            char dm_cmd[64];
+            vm_agent_display_mode_command(vm, dm_cmd, sizeof(dm_cmd));
+            n = send_tagged_cmd(s, vm, &conn->cmd_seq, dm_cmd, buf, sizeof(buf));
+            if (n <= 0) goto disconnected;
+            ui_log(L"Display mode sync for \"%s\": %S -> %S", vm->name, dm_cmd + 17, buf);
         }
 
         /* Send GPU share info to agent (if GPU-PV is assigned).
@@ -664,4 +680,13 @@ BOOL vm_agent_restart(VmInstance *instance)
 BOOL vm_agent_ping(VmInstance *instance)
 {
     return vm_agent_send(instance, "ping", NULL, 0, 5000);
+}
+
+void vm_agent_display_mode_command(const VmInstance *instance, char *buf, int buf_size)
+{
+    int w  = instance->display_width  > 0 ? instance->display_width  : DISPLAY_DEFAULT_WIDTH;
+    int h  = instance->display_height > 0 ? instance->display_height : DISPLAY_DEFAULT_HEIGHT;
+    int hz = instance->display_hz     > 0 ? instance->display_hz     : DISPLAY_DEFAULT_HZ;
+    sprintf_s(buf, (size_t)buf_size, "set_display_mode:%dx%d@%d:%d", w, h, hz,
+              instance->display_mode_list ? 1 : 0);
 }

@@ -35,6 +35,14 @@
    thread that connects + reconstructs frames, and writes ch3 input on demand. */
 - (instancetype)initWithName:(NSString *)name
                    transport:(AsbIvshmemTransport *)transport;
+/* Same, sized for the VM's configured guest display mode: the window opens with
+   a content area matching displayWidth x displayHeight (in points, shrunk to fit
+   the screen) instead of a fixed 1280x720, and re-fits when the guest changes
+   mode. 0/0 = 1920x1080. */
+- (instancetype)initWithName:(NSString *)name
+                   transport:(AsbIvshmemTransport *)transport
+                displayWidth:(int)displayWidth
+               displayHeight:(int)displayHeight;
 - (void)showDisplay;
 
 @end

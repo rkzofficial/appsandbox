@@ -25,6 +25,14 @@
 #include <shlobj.h>
 #include <stdarg.h>
 #include <virtdisk.h>
+
+/* Fill unset (0) display-mode fields with the 1080p60 defaults. */
+static void display_mode_defaults(int *w, int *h, int *hz)
+{
+    if (*w  <= 0) *w  = DISPLAY_DEFAULT_WIDTH;
+    if (*h  <= 0) *h  = DISPLAY_DEFAULT_HEIGHT;
+    if (*hz <= 0) *hz = DISPLAY_DEFAULT_HZ;
+}
 #pragma comment(lib, "virtdisk.lib")
 
 /* ---- DLL module handle (for locating iso-patch.exe, resources, etc.) ---- */
@@ -489,6 +497,11 @@ static void save_vm_list(void)
         fwprintf(f, L"GpuMode=%d\n", g_vms[i].gpu_mode);
         fwprintf(f, L"GpuName=%s\n", g_vms[i].gpu_name);
         fwprintf(f, L"NetworkMode=%d\n", g_vms[i].network_mode);
+        fwprintf(f, L"DisplayWidth=%d\n", g_vms[i].display_width);
+        fwprintf(f, L"DisplayHeight=%d\n", g_vms[i].display_height);
+        fwprintf(f, L"DisplayHz=%d\n", g_vms[i].display_hz);
+        if (g_vms[i].display_mode_list)
+            fwprintf(f, L"DisplayModeList=1\n");
         if (g_vms[i].net_adapter[0] != L'\0')
             fwprintf(f, L"NetAdapter=%s\n", g_vms[i].net_adapter);
         if (g_vms[i].resources_iso_path[0] != L'\0')
@@ -583,6 +596,14 @@ static void load_vm_list(void)
             { /* ignored - backwards compat */ }
         else if (wcsncmp(line, L"NetworkMode=", 12) == 0)
             vm->network_mode = _wtoi(line + 12);
+        else if (wcsncmp(line, L"DisplayWidth=", 13) == 0)
+            vm->display_width = _wtoi(line + 13);
+        else if (wcsncmp(line, L"DisplayHeight=", 14) == 0)
+            vm->display_height = _wtoi(line + 14);
+        else if (wcsncmp(line, L"DisplayHz=", 10) == 0)
+            vm->display_hz = _wtoi(line + 10);
+        else if (wcsncmp(line, L"DisplayModeList=", 16) == 0)
+            vm->display_mode_list = (_wtoi(line + 16) != 0);
         else if (wcsncmp(line, L"NetAdapter=", 11) == 0)
             wcscpy_s(vm->net_adapter, 256, line + 11);
         else if (wcsncmp(line, L"ResourcesIso=", 13) == 0)
@@ -620,6 +641,9 @@ static void load_vm_list(void)
             wchar_t *last_slash;
             g_vms[i].handle = NULL;
             g_vms[i].running = FALSE;
+            /* VMs saved before the display setting existed: default 1080p60. */
+            display_mode_defaults(&g_vms[i].display_width, &g_vms[i].display_height,
+                                  &g_vms[i].display_hz);
             if (vm_load_state_json(g_vms[i].vhdx_path))
                 g_vms[i].install_complete = TRUE;
             wcscpy_s(snap_dir, MAX_PATH, g_vms[i].vhdx_path);
@@ -1722,7 +1746,8 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
                                          const char *host_locale,
                                          const char *host_xkb,
                                          const char *host_tz,
-                                         const wchar_t *vm_name)
+                                         const wchar_t *vm_name,
+                                         const char *display_mode)
 {
     wchar_t extras[MAX_PATH];
     CreateDirectoryW(staging, NULL);
@@ -1800,6 +1825,15 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
                                host_utf8, strlen(host_utf8),
                                L"/etc/appsandbox-hostname");
         asb_log(L"Linux hostname: staged /etc/appsandbox-hostname = %s", vm_name);
+    }
+
+    /* Guest display mode "WxH@Hz": firstboot STEP 10 substitutes it into the
+     * asb_drm modprobe options line (width=/height=/refresh=). */
+    if (display_mode && display_mode[0]) {
+        n += stage_marker_file(f, staging, L"display.marker",
+                               display_mode, strlen(display_mode),
+                               L"/etc/appsandbox-display");
+        asb_log(L"Linux display: staged /etc/appsandbox-display = %hs", display_mode);
     }
 
     fclose(f);
@@ -2284,12 +2318,19 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
                                 host_xkb, sizeof(host_xkb),
                                 host_tz, sizeof(host_tz));
 
+    char display_mode[48];
+    sprintf_s(display_mode, sizeof(display_mode), "%dx%d@%d",
+              args->config.display_width  > 0 ? args->config.display_width  : DISPLAY_DEFAULT_WIDTH,
+              args->config.display_height > 0 ? args->config.display_height : DISPLAY_DEFAULT_HEIGHT,
+              args->config.display_hz     > 0 ? args->config.display_hz     : DISPLAY_DEFAULT_HZ);
+
     int n_staged = generate_vhdx_manifest_ubuntu(manifest, staging, res_dir,
                                                   args->config.ssh_enabled,
                                                   args->config.admin_user,
                                                   admin_pw_hash,
                                                   host_locale, host_xkb, host_tz,
-                                                  args->config.name);
+                                                  args->config.name,
+                                                  display_mode);
     SecureZeroMemory(admin_pw_hash, sizeof(admin_pw_hash));
     if (n_staged < 0) {
         args->result = E_FAIL;
@@ -2632,6 +2673,15 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     cfg.cpu_cores = config->cpu_cores;
     cfg.gpu_mode = config->gpu_mode;
     cfg.network_mode = config->network_mode;
+    cfg.display_width  = config->display_width;
+    cfg.display_height = config->display_height;
+    cfg.display_hz     = config->display_hz;
+    cfg.display_mode_list = config->display_mode_list;
+    display_mode_defaults(&cfg.display_width, &cfg.display_height, &cfg.display_hz);
+    if (asb_display_mode_validate(cfg.display_width, cfg.display_height, cfg.display_hz)) {
+        asb_log(L"Error: invalid display mode %dx%d@%d.", cfg.display_width, cfg.display_height, cfg.display_hz);
+        return E_INVALIDARG;
+    }
     cfg.test_mode = config->test_mode;
     cfg.ssh_enabled = config->ssh_enabled;
     /* Key deploy needs SSH; prepare the AppSandbox keypair now so the build path
@@ -2793,6 +2843,10 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             wcscpy_s(inst->gpu_name, 256, cfg.gpu_mode == GPU_MIRROR ? L"Try all" :
                                           cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
             inst->network_mode = cfg.network_mode;
+            inst->display_width  = cfg.display_width;
+            inst->display_height = cfg.display_height;
+            inst->display_hz     = cfg.display_hz;
+            inst->display_mode_list = cfg.display_mode_list;
             inst->is_template = is_template_create;
             inst->test_mode = cfg.test_mode;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
@@ -2862,6 +2916,10 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             wcscpy_s(inst->gpu_name, 256, cfg.gpu_mode == GPU_MIRROR ? L"Try all" :
                                           cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
             inst->network_mode = cfg.network_mode;
+            inst->display_width  = cfg.display_width;
+            inst->display_height = cfg.display_height;
+            inst->display_hz     = cfg.display_hz;
+            inst->display_mode_list = cfg.display_mode_list;
             inst->is_template = FALSE;
             inst->test_mode = cfg.test_mode;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
@@ -3029,6 +3087,10 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
     wcscpy_s(inst->gpu_name, 256, cfg.gpu_mode == GPU_MIRROR ? L"Try all" :
                                   cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
+    inst->display_width  = cfg.display_width;
+    inst->display_height = cfg.display_height;
+    inst->display_hz     = cfg.display_hz;
+    inst->display_mode_list = cfg.display_mode_list;
     wcscpy_s(inst->resources_iso_path, MAX_PATH, cfg.resources_iso_path);
     /* hcs_create_vm copies ssh_enabled onto the instance but not the deploy
        fields, so the from-template path sets them here (the ISO and Linux
@@ -3120,6 +3182,10 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         args->config.cpu_cores = inst->cpu_cores;
         args->config.gpu_mode = inst->gpu_mode;
         args->config.network_mode = inst->network_mode;
+        args->config.display_width  = inst->display_width;
+        args->config.display_height = inst->display_height;
+        args->config.display_hz     = inst->display_hz;
+        args->config.display_mode_list = inst->display_mode_list;
         args->config.test_mode = inst->test_mode;
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
@@ -3368,6 +3434,30 @@ ASB_API int asb_vm_network_mode(AsbVm vm)
     return inst ? inst->network_mode : 0;
 }
 
+ASB_API int asb_vm_display_width(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return (inst && inst->display_width > 0) ? inst->display_width : DISPLAY_DEFAULT_WIDTH;
+}
+
+ASB_API int asb_vm_display_height(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return (inst && inst->display_height > 0) ? inst->display_height : DISPLAY_DEFAULT_HEIGHT;
+}
+
+ASB_API int asb_vm_display_hz(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return (inst && inst->display_hz > 0) ? inst->display_hz : DISPLAY_DEFAULT_HZ;
+}
+
+ASB_API BOOL asb_vm_display_mode_list(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->display_mode_list : FALSE;
+}
+
 ASB_API BOOL asb_vm_ssh_enabled(AsbVm vm)
 {
     VmInstance *inst = vm_inst(vm);
@@ -3449,6 +3539,52 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
     if (mode < 0 || mode > 3) return E_INVALIDARG;
     g_vms[idx].network_mode = mode;
     save_vm_list();
+    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    return S_OK;
+}
+
+ASB_API const char *asb_display_mode_validate(int width, int height, int hz)
+{
+    if (width < DISPLAY_MIN_WIDTH || width > DISPLAY_MAX_WIDTH)
+        return "displayWidth must be between 640 and 7680 pixels.";
+    if (height < DISPLAY_MIN_HEIGHT || height > DISPLAY_MAX_HEIGHT)
+        return "displayHeight must be between 480 and 4320 pixels.";
+    if ((width % 2) != 0 || (height % 2) != 0)
+        return "displayWidth and displayHeight must be even.";
+    if (hz < DISPLAY_MIN_HZ || hz > DISPLAY_MAX_HZ)
+        return "displayHz must be between 24 and 500 Hz.";
+    return NULL;
+}
+
+ASB_API HRESULT asb_vm_set_display(AsbVm vm, int width, int height, int hz, int mode_list)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    if (width < 0 || height < 0 || hz < 0) return E_INVALIDARG;   /* 0 = keep current */
+    if (width == 0)  width  = g_vms[idx].display_width;
+    if (height == 0) height = g_vms[idx].display_height;
+    if (hz == 0)     hz     = g_vms[idx].display_hz;
+    display_mode_defaults(&width, &height, &hz);
+    if (asb_display_mode_validate(width, height, hz)) return E_INVALIDARG;
+
+    g_vms[idx].display_width  = width;
+    g_vms[idx].display_height = height;
+    g_vms[idx].display_hz     = hz;
+    if (mode_list >= 0) g_vms[idx].display_mode_list = mode_list ? TRUE : FALSE;
+    save_vm_list();
+    asb_log(L"Display mode for \"%s\": %dx%d @ %d Hz%s", g_vms[idx].name, width, height, hz,
+            g_vms[idx].display_mode_list ? L" (+ mode list)" : L"");
+
+    /* Live apply: the guest agent rewrites the display driver's configuration and
+       restarts it; the viewer picks the new size up from the next frame header.
+       Fire-and-forget so the GUI / HTTP thread never blocks on the guest (the VDD
+       restart takes a few seconds); the agent logs progress back via log: lines. */
+    if (g_vms[idx].running && g_vms[idx].agent_online) {
+        char cmd[64];
+        vm_display_mode_command(&g_vms[idx], cmd, sizeof(cmd));
+        vm_agent_send(&g_vms[idx], cmd, NULL, 0, 0);
+    }
+
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
     return S_OK;
 }
