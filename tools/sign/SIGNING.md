@@ -122,8 +122,26 @@ tools\sign\make-release.ps1 -Platform ARM64  # Windows on ARM
   total.** (If `bin\Release\drivers-signed\` already exists it's reused — no resubmit.)
 - **If the YubiKey is out:** stops after the build — no signing, no ZIP.
 
-Switches: `-NoBuild`, `-SkipDrivers`, `-ForceDriverSign`, `-Version <v>`. The version comes
+Switches: `-NoBuild`, `-SkipDrivers`, `-ForceDriverSign`, `-Version <v>`,
+`-SignMode ev|store|none`, `-CertThumbprint <sha1>`. The version comes
 from `Directory.Build.props` unless `-Version` overrides it.
+
+### CI builds (`.github/workflows/release.yml`)
+A `v*` tag builds both platforms on GitHub-hosted runners and opens a **draft** release.
+A runner cannot use a hardware token, so `-SignMode` picks a different identity:
+
+| `-SignMode` | Identity | Drivers | ZIP name |
+|---|---|---|---|
+| `ev` (default) | the EV YubiKey; nothing is signed or zipped without it | EV-signed, then Microsoft attestation-signed | `AppSandbox-<ver>-win-x64.zip` |
+| `store` | a private-key cert already in `CurrentUser\My` / `LocalMachine\My` (`-CertThumbprint`), e.g. a PFX imported from a CI secret | untouched: WDK test-signed, catalogs still valid | `AppSandbox-<ver>-win-x64.zip` |
+| `none` | none — packaging only | untouched: WDK test-signed | `AppSandbox-<ver>-win-x64-unsigned.zip` |
+
+`store` and `none` **never** attempt driver attestation (it needs the token plus a Partner
+Center round-trip) and deliberately leave the driver binaries alone: re-signing a `.sys`/`.dll`
+would break the test-signed `.cat` shipped beside it. So a CI package is for testing —
+a shippable release still comes from `make-release.ps1` on the maintainer's machine with the
+token in. The workflow also cannot include `release\resources\linux\` (the Ubuntu guest
+payload, built out-of-tree and not committed).
 
 ### Driver attestation only (when a driver changes)
 ```powershell

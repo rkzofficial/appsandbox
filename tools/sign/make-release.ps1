@@ -19,6 +19,16 @@
     .\make-release.ps1 -NoBuild         # package the current bin\Release[-ARM64]
     .\make-release.ps1 -SkipDrivers     # sign app binaries + zip; leave drivers as-is
     .\make-release.ps1 -ForceDriverSign # re-submit drivers for attestation even if cached
+    .\make-release.ps1 -SignMode none   # CI: package an UNSIGNED zip (no token, no attestation)
+    .\make-release.ps1 -SignMode store -CertThumbprint <sha1>
+                                        # CI: sign with a cert already in the machine/user store
+                                        # (e.g. a PFX imported from a secret) instead of the token
+
+  -SignMode selects where the signing identity comes from. 'ev' (default) keeps the
+  behaviour above: nothing is signed or zipped without the EV token. 'store' and 'none'
+  exist for automation, which cannot use a hardware token; both SKIP driver attestation
+  (a Partner Center round-trip), so the drivers stay WDK test-signed and the zip is
+  named '-unsigned' under 'none'. Neither mode can produce a shippable signed release.
 
   -Platform selects the bin\ output dir (ARM64 -> bin\Release-ARM64), the driver
   attestation OS/signature codes (sign-drivers.ps1 -Platform rewrites the x64 config
@@ -34,7 +44,9 @@ param(
   [switch]$NoBuild,
   [switch]$BuildOnly,
   [switch]$SkipDrivers,
-  [switch]$ForceDriverSign
+  [switch]$ForceDriverSign,
+  [ValidateSet('ev','store','none')][string]$SignMode = 'ev',
+  [string]$CertThumbprint = ''
 )
 $ErrorActionPreference = 'Stop'
 
@@ -258,21 +270,42 @@ if (-not (Test-Path $bin)) { throw "Output dir not found: $bin" }
 
 if ($BuildOnly) { Write-Host "-BuildOnly: build complete; skipping signing + packaging."; return }
 
-# ---------------------------------------------------------------- 2. YubiKey gate
+# ------------------------------------------------------- 2. resolve signing identity
 
-$ev = Get-EvCert
-if (-not $ev) {
-    Write-Host ""
-    Write-Host "================================================================"
-    Write-Host " No App Sandbox LLC EV YubiKey detected."
-    Write-Host " SKIPPING: app signing, driver attestation, and ZIP packaging."
-    Write-Host " The build is complete; drivers remain test-signed (dev build)."
-    Write-Host " Insert the YubiKey and re-run to produce a signed release."
-    Write-Host "================================================================"
-    return
+$ev = $null
+switch ($SignMode) {
+  'ev' {
+    # The YubiKey gate: no token -> no signing, no attestation, no zip.
+    $ev = Get-EvCert
+    if (-not $ev) {
+        Write-Host ""
+        Write-Host "================================================================"
+        Write-Host " No App Sandbox LLC EV YubiKey detected."
+        Write-Host " SKIPPING: app signing, driver attestation, and ZIP packaging."
+        Write-Host " The build is complete; drivers remain test-signed (dev build)."
+        Write-Host " Insert the YubiKey and re-run to produce a signed release."
+        Write-Host " (Automation without a token: -SignMode none / -SignMode store.)"
+        Write-Host "================================================================"
+        return
+    }
+    Write-Host ("EV YubiKey present: {0} [{1}]" -f $ev.Subject, $ev.Thumbprint)
+  }
+  'store' {
+    if (-not $CertThumbprint) { throw "-SignMode store requires -CertThumbprint." }
+    $tp = ($CertThumbprint -replace '[^0-9A-Fa-f]', '').ToUpper()
+    foreach ($store in @('Cert:\CurrentUser\My', 'Cert:\LocalMachine\My')) {
+        $ev = Get-ChildItem $store -ErrorAction SilentlyContinue |
+              Where-Object { $_.Thumbprint -eq $tp -and $_.HasPrivateKey } | Select-Object -First 1
+        if ($ev) { break }
+    }
+    if (-not $ev) { throw "No private-key certificate with thumbprint $tp in CurrentUser\My or LocalMachine\My." }
+    Write-Host ("Store certificate: {0} [{1}]" -f $ev.Subject, $ev.Thumbprint)
+  }
+  'none' {
+    Write-Host "-SignMode none: packaging an UNSIGNED build (no signing, no attestation)."
+  }
 }
-Write-Host ("EV YubiKey present: {0} [{1}]" -f $ev.Subject, $ev.Thumbprint)
-$signtool = Find-SignTool
+$signtool = if ($SignMode -eq 'none') { $null } else { Find-SignTool }
 
 # --------------------------------------- 3. EV-sign ALL binaries: app + drivers (1 PIN)
 # ONE signtool call over every PE we build - app .exe/.dll AND the driver .sys/.dll in
@@ -282,21 +315,32 @@ $signtool = Find-SignTool
 # is left as Microsoft shipped it.
 # WebView2Loader.dll and devcon.exe are Microsoft's binaries - never re-sign them with our cert.
 $msBinaries = @('WebView2Loader.dll', 'devcon.exe')
-$toSign = @(Get-ChildItem $bin -Recurse -Include *.exe, *.dll, *.sys | Where-Object {
-    ($_.Name -notin $msBinaries) -and
-    ($_.FullName -notmatch '\\(drivers-signed|_attest|_package)\\') -and
-    (-not (Test-OurEvSigned $_.FullName $ev.Thumbprint))
-}) | ForEach-Object { $_.FullName }
+# Outside 'ev' mode the drivers are left exactly as the WDK built them: re-signing a
+# driver .sys/.dll would change its bytes and break the test-signed .cat that ships
+# beside it (only the Microsoft attestation round-trip, which needs the token, produces
+# a catalog over EV-signed driver binaries). So 'store'/'none' sign the app only.
+$toSign = @()
+if ($SignMode -ne 'none') {
+    $toSign = @(Get-ChildItem $bin -Recurse -Include *.exe, *.dll, *.sys | Where-Object {
+        ($_.Name -notin $msBinaries) -and
+        ($_.FullName -notmatch '\\(drivers-signed|_attest|_package)\\') -and
+        ($SignMode -eq 'ev' -or $_.FullName -notmatch '\\drivers\\') -and
+        (-not (Test-OurEvSigned $_.FullName $ev.Thumbprint))
+    }) | ForEach-Object { $_.FullName }
+}
 
 if ($toSign.Count -gt 0) {
-    Write-Host "EV-signing $($toSign.Count) binaries (app + drivers) - enter the YubiKey PIN when prompted..."
+    $what = if ($SignMode -eq 'ev') { 'app + drivers' } else { 'app only; drivers left WDK test-signed' }
+    Write-Host "Signing $($toSign.Count) binaries ($what) with [$($ev.Thumbprint)]..."
     & $signtool sign /sha1 $ev.Thumbprint /fd SHA256 /tr $tsUrl /td SHA256 /v @toSign
     if ($LASTEXITCODE -ne 0) { throw "Binary EV-signing failed (exit $LASTEXITCODE)." }
     & $signtool verify /pa @toSign | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Binary signature verify failed." }
     Write-Host "Binaries signed + verified."
+} elseif ($SignMode -eq 'none') {
+    Write-Host "Skipping binary signing (-SignMode none)."
 } else {
-    Write-Host "All binaries already EV-signed by our cert - nothing to re-sign."
+    Write-Host "All binaries already signed by our cert - nothing to re-sign."
 }
 
 # ------------------------------------------------- 4. ensure MS-signed drivers (this version)
@@ -309,7 +353,12 @@ if ($toSign.Count -gt 0) {
 
 $signedDir  = Join-Path $bin 'drivers-signed'
 $driversDir = Join-Path $bin 'drivers'
-if (-not $SkipDrivers) {
+if ($SkipDrivers -or $SignMode -ne 'ev') {
+    if ($SignMode -ne 'ev') {
+        Write-Host "Skipping driver attestation (-SignMode $SignMode): it needs the EV token and a"
+        Write-Host "Partner Center round-trip, so the drivers stay WDK test-signed in this package."
+    }
+} else {
     $haveSigned = (Test-DriverSigned $driversDir 'AppSandboxVDD' $asb.Full) -and `
                   (Test-DriverSigned $driversDir 'AppSandboxVAD' $asb.Full) -and `
                   (Test-DriverSigned $driversDir 'AppSandboxSHM' $asb.Full)
@@ -416,7 +465,9 @@ $files | ForEach-Object { Write-Host ("  " + $_.FullName.Substring($stage.Length
 $mb = [math]::Round((($files | Measure-Object Length -Sum).Sum) / 1MB, 1)
 Write-Host ("--- {0} files, {1} MB ---`n" -f $files.Count, $mb)
 
-$zip = Join-Path $bin ("AppSandbox-{0}-{1}-{2}.zip" -f $Version, $OS, $Platform.ToLower())
+# An unsigned package is named so it can never be mistaken for a shippable release.
+$suffix = if ($SignMode -eq 'none') { '-unsigned' } else { '' }
+$zip = Join-Path $bin ("AppSandbox-{0}-{1}-{2}{3}.zip" -f $Version, $OS, $Platform.ToLower(), $suffix)
 if (Test-Path $zip) { Remove-Item $zip -Force }
 # Flat layout: the items sit at the zip root (file.zip\AppSandbox.exe, file.zip\drivers\...),
 # with the drivers\ / resources\ / web\ subfolders preserved - no extra parent folder.
