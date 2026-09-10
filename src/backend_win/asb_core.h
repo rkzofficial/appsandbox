@@ -62,6 +62,10 @@ typedef struct {
     BOOL   ssh_enabled;            /* TRUE = install OpenSSH Server in guest */
     BOOL   ssh_deploy_key;         /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
     BOOL   is_template;            /* TRUE = create as template VM */
+    int    display_width;          /* guest display mode; 0 = default (1920x1080 @ 60 Hz) */
+    int    display_height;
+    int    display_hz;
+    BOOL   display_mode_list;      /* TRUE = also advertise the built-in mode table to the guest */
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
@@ -166,6 +170,11 @@ ASB_API DWORD   asb_vm_hdd_gb(AsbVm vm);
 ASB_API DWORD   asb_vm_cpu_cores(AsbVm vm);
 ASB_API int     asb_vm_gpu_mode(AsbVm vm);
 ASB_API int     asb_vm_network_mode(AsbVm vm);
+/* Guest display mode (resolution + refresh). Never 0: defaults apply. */
+ASB_API int     asb_vm_display_width(AsbVm vm);
+ASB_API int     asb_vm_display_height(AsbVm vm);
+ASB_API int     asb_vm_display_hz(AsbVm vm);
+ASB_API BOOL    asb_vm_display_mode_list(AsbVm vm);
 ASB_API BOOL    asb_vm_ssh_enabled(AsbVm vm);
 ASB_API DWORD   asb_vm_ssh_port(AsbVm vm);
 
@@ -176,6 +185,16 @@ ASB_API HRESULT asb_vm_set_ram(AsbVm vm, DWORD ram_mb);
 ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores);
 ASB_API HRESULT asb_vm_set_gpu(AsbVm vm, int gpu_mode);
 ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode);
+/* Set the guest display mode. Unlike the other setters this is allowed while
+   the VM is running: the new mode is persisted and, if the guest agent is
+   online, pushed to the guest immediately (the guest's display driver is
+   restarted at the new mode and the viewer follows the next frame header).
+   mode_list < 0 leaves the current ModeList flag unchanged.
+   Returns E_INVALIDARG for out-of-range values (see DISPLAY_* in hcs_vm.h). */
+ASB_API HRESULT asb_vm_set_display(AsbVm vm, int width, int height, int hz, int mode_list);
+/* Validate a display mode without applying it. Returns NULL if valid, else an
+   English reason. */
+ASB_API const char *asb_display_mode_validate(int width, int height, int hz);
 
 /* ---- Snapshots ---- */
 

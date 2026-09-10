@@ -191,7 +191,8 @@ methods return `(http_status, body)` so you can branch on the status code.
 
 A **status object** has: `name, osType, state, running, agentOnline,
 installComplete, building, progress, sshState, sshPort, ramMb, hddGb, cpuCores,
-gpuMode, networkMode, displayOpen`.
+gpuMode, networkMode, displayWidth, displayHeight, displayHz, displayModeList,
+displayOpen`.
 
 ### Lifecycle  *(return `(status, body)`)*
 | Method | Effect |
@@ -258,6 +259,8 @@ it (good in the GUI, wrong for a CLI).
 | `display_ready(name)` | `bool` — shorthand for `display_status()["ready"]` |
 | `open_display(name)` | `(status, body)` — open (or focus) the window |
 | `close_display(name)` | `(status, body)` — close it |
+| `display_mode(name)` | `{displayWidth, displayHeight, displayHz, displayModeList, applied}` — the configured guest display mode (`GET /vms/{n}/display/mode`) |
+| `set_display_mode(name, width, height, hz, mode_list)` | `(status, body)` — change the guest display mode (`PUT /vms/{n}/display/mode`). **Works while the VM is running**: the guest agent rewrites the display driver's mode and restarts it (a few seconds of black), and the display window follows the next frame. `applied` is `"live"` or `"next_boot"`. |
 
 The pattern is **poll-then-open**:
 
@@ -312,6 +315,9 @@ rather than forwarding bad input to the core.
 | `gpuMode` | `0` None · `1` Default (paravirtual) · `2` Try all |
 | `networkMode` | `0` None · `1` NAT · `2` External · `3` Internal |
 | `netAdapter` | host adapter name (for External mode) |
+| `displayWidth` / `displayHeight` | guest display resolution in pixels, even values, 640–7680 × 480–4320 (default **1920 × 1080**) |
+| `displayHz` | guest display refresh rate, 24–500 Hz (default **60**). The guest composes at this rate; the host window shows frames as fast as the readback + transport deliver them (the title bar shows the delivered fps) |
+| `displayModeList` | `false` (default) = the guest sees exactly the configured mode · `true` = the built-in mode table (720p…4K × 60–240 Hz) is advertised too, so the guest can switch modes in its own Display Settings |
 | `adminUser` | required for a normal create. Linux: ≤32, starts `[a-z_]`, body `[a-z0-9_-]`. Windows: ≤20, none of `"\/[]:;|=,+*?<>`, no trailing `.`, not a reserved name (CON, PRN, …). |
 | `adminPass` | required on Linux (≤255 bytes); optional on Windows |
 | `testMode` | skip interactive setup where supported |
@@ -319,8 +325,10 @@ rather than forwarding bad input to the core.
 | `sshDeployKey` | deploy the AppSandbox public key for password-less login (**requires `sshEnabled`**; rejected `400` otherwise) |
 | `isTemplate` | build a template (Windows only; can't be built from another template) |
 
-`edit()` accepts `ramMb`, `cpuCores`, `gpuMode`, `networkMode` with the same
-range rules, and **only while the VM is stopped**. `name` cannot be changed.
+`edit()` accepts `ramMb`, `cpuCores`, `gpuMode`, `networkMode`, `displayWidth`,
+`displayHeight`, `displayHz`, `displayModeList` with the same range rules, and
+**only while the VM is stopped**. `name` cannot be changed. The display mode can
+also be changed **live** on a running VM — see `set_display_mode()` under Display.
 
 ### SSH key deploy (password-less login)
 

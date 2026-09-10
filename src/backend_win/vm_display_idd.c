@@ -24,6 +24,7 @@
 #pragma warning(disable: 4201) /* nameless struct/union in SDK headers */
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_5.h>
 #include <d3dcompiler.h>
 #pragma warning(pop)
 
@@ -34,6 +35,7 @@
 #include "vm_clipboard.h"
 #include "vm_agent.h"
 #include "hcs_vm.h"
+#include "asb_core.h"   /* asb_vm_set_display / asb_vm_display_* for the Display mode menu */
 #include "ui.h"
 #include "resource.h"
 
@@ -100,10 +102,15 @@ typedef struct AudioFrameHeader {
 /* ---- Frame protocol constants ---- */
 
 #define FRAME_MAGIC         0x52465341  /* "ASFR" little-endian */
-#define DEFAULT_WIDTH       1920
+#define DEFAULT_WIDTH       1920        /* frame size assumed before the first header arrives */
 #define DEFAULT_HEIGHT      1080
 #define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+/* Hard ceiling on a single frame payload (8K BGRA). The receive buffer starts
+   at the VM's configured mode and grows on demand up to this, so the guest is
+   free to run any mode the VDD advertises (1080p, 1440p, 4K, ...). */
+#define MAX_FRAME_WIDTH     7680
+#define MAX_FRAME_HEIGHT    4320
+#define MAX_FRAME_DATA_SIZE (MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 4)
 
 /* ---- Input protocol (host → guest) ---- */
 
@@ -138,7 +145,10 @@ typedef struct InputPacket {
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
-#define PRESENT_MS      16   /* ~60 fps */
+#define PRESENT_MS      16   /* idle-repaint fallback only: real presents are driven
+                                per received frame by WM_IDD_FRAME_READY, so the
+                                display keeps up with 120/144/240 Hz guests */
+#define TITLE_REFRESH_MS 500 /* window-title (mode + fps) refresh cadence */
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -215,9 +225,13 @@ struct VmDisplayIdd {
     ID3D11Device            *device;
     ID3D11DeviceContext     *ctx;
     IDXGISwapChain          *swap_chain;
+    BOOL                     flip_model;     /* FLIP_DISCARD swap chain (else legacy bitblt) */
+    BOOL                     allow_tearing;  /* DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING in use */
     ID3D11RenderTargetView  *rtv;
     ID3D11Texture2D         *frame_tex;
     ID3D11ShaderResourceView *frame_srv;
+    UINT                     tex_width;      /* size of frame_tex (window thread only) */
+    UINT                     tex_height;
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
     ID3D11SamplerState      *sampler;
@@ -229,9 +243,20 @@ struct VmDisplayIdd {
     UINT           frame_stride;
     CRITICAL_SECTION frame_cs;
     volatile BOOL  frame_dirty;
+    volatile LONG  frame_posted;     /* 1 while a WM_IDD_FRAME_READY is queued (coalesces posts) */
+
+    /* Configured guest mode (from the VM's settings): used to size the window
+       before the first frame arrives and reported in the title. */
+    UINT           cfg_width;
+    UINT           cfg_height;
+    UINT           cfg_hz;
+    UINT           fit_width;        /* frame size the window was last fitted to */
+    UINT           fit_height;
 
     UINT           render_count;     /* number of renders (for one-shot logging) */
     volatile UINT  recv_count;       /* number of frames received over HvSocket */
+    volatile UINT  recv_fps;         /* frames received in the last 1 s window */
+    ULONGLONG      title_tick;       /* GetTickCount64() of the last title update */
 
     /* Input forwarding */
     volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
@@ -289,6 +314,19 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
+/* Display mode submenu: IDM_DISPLAY_MODE_BASE + 0x10*i selects g_display_presets[i];
+   IDM_DISPLAY_MODE_LIST toggles "guest may pick other modes". */
+#define IDM_DISPLAY_MODE_BASE  0x2000
+#define IDM_DISPLAY_MODE_LIST  0x2F00
+#define IDM_DISPLAY_MODE_LAST  0x2EF0
+
+static const struct { UINT w, h, hz; } g_display_presets[] = {
+    { 1920, 1080,  60 }, { 1920, 1080, 120 }, { 1920, 1080, 144 }, { 1920, 1080, 240 },
+    { 2560, 1440,  60 }, { 2560, 1440, 120 }, { 2560, 1440, 144 }, { 2560, 1440, 165 }, { 2560, 1440, 240 },
+    { 3440, 1440, 144 },
+    { 3840, 2160,  60 }, { 3840, 2160, 120 },
+};
+#define DISPLAY_PRESET_COUNT (sizeof(g_display_presets) / sizeof(g_display_presets[0]))
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 
@@ -701,6 +739,80 @@ static void idd_remove_kbd_hook(VmDisplayIdd *d)
     t_hook_display = NULL;
 }
 
+/* Radio-check the system-menu entry matching the VM's configured display mode
+   and the mode-list toggle. */
+static void idd_sync_display_mode_menu(VmDisplayIdd *d)
+{
+    HMENU sysmenu;
+    UINT i, w, h, hz;
+    if (!d || !d->hwnd || !d->vm) return;
+    sysmenu = GetSystemMenu(d->hwnd, FALSE);
+    if (!sysmenu) return;
+    w  = (UINT)asb_vm_display_width((AsbVm)d->vm);
+    h  = (UINT)asb_vm_display_height((AsbVm)d->vm);
+    hz = (UINT)asb_vm_display_hz((AsbVm)d->vm);
+    for (i = 0; i < DISPLAY_PRESET_COUNT; i++) {
+        BOOL on = (g_display_presets[i].w == w && g_display_presets[i].h == h &&
+                   g_display_presets[i].hz == hz);
+        CheckMenuItem(sysmenu, IDM_DISPLAY_MODE_BASE + 0x10 * i,
+                      MF_BYCOMMAND | (on ? MF_CHECKED : MF_UNCHECKED));
+    }
+    CheckMenuItem(sysmenu, IDM_DISPLAY_MODE_LIST,
+                  MF_BYCOMMAND | (asb_vm_display_mode_list((AsbVm)d->vm) ? MF_CHECKED : MF_UNCHECKED));
+}
+
+/* Shrink a desired client size so the whole window fits the primary monitor's
+   work area, preserving aspect. */
+static void idd_clamp_client_to_work_area(DWORD style, DWORD exstyle, UINT *cw, UINT *ch)
+{
+    RECT work, frame = { 0, 0, 0, 0 };
+    UINT avail_w, avail_h;
+
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) return;
+    AdjustWindowRectEx(&frame, style, FALSE, exstyle);   /* non-client extents */
+    avail_w = (UINT)((work.right - work.left) - (frame.right - frame.left));
+    avail_h = (UINT)((work.bottom - work.top) - (frame.bottom - frame.top));
+    if (avail_w < 320 || avail_h < 180) return;
+
+    if (*cw > avail_w || *ch > avail_h) {
+        double sx = (double)avail_w / (double)*cw;
+        double sy = (double)avail_h / (double)*ch;
+        double sc = sx < sy ? sx : sy;
+        *cw = (UINT)((double)*cw * sc);
+        *ch = (UINT)((double)*ch * sc);
+        if (*cw < 320) *cw = 320;
+        if (*ch < 180) *ch = 180;
+    }
+}
+
+/* Resize the top-level window so its client area matches the guest frame
+   (1:1), or as large as fits the work area. Called on the window thread when
+   the first frame of a new size arrives (guest mode change). */
+static void idd_fit_window_to_frame(VmDisplayIdd *d, UINT fw, UINT fh)
+{
+    DWORD style, exstyle;
+    RECT wr = { 0, 0, 0, 0 }, cur;
+    UINT cw = fw, ch = fh;
+
+    if (!d->hwnd || fw == 0 || fh == 0) return;
+    d->fit_width  = fw;
+    d->fit_height = fh;
+
+    if (IsZoomed(d->hwnd) || IsIconic(d->hwnd)) return;  /* respect maximized/minimized */
+
+    style   = (DWORD)GetWindowLongW(d->hwnd, GWL_STYLE);
+    exstyle = (DWORD)GetWindowLongW(d->hwnd, GWL_EXSTYLE);
+    idd_clamp_client_to_work_area(style, exstyle, &cw, &ch);
+    wr.right = (LONG)cw; wr.bottom = (LONG)ch;
+    AdjustWindowRectEx(&wr, style, FALSE, exstyle);
+
+    GetWindowRect(d->hwnd, &cur);
+    SetWindowPos(d->hwnd, NULL, cur.left, cur.top,
+                 wr.right - wr.left, wr.bottom - wr.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    idd_log(d, L"Window fitted to guest mode %ux%u (client %ux%u).", fw, fh, cw, ch);
+}
+
 /* Compute letterboxed/pillarboxed viewport within client rect */
 static void compute_letterbox(UINT client_w, UINT client_h,
                               UINT frame_w, UINT frame_h,
@@ -1046,39 +1158,129 @@ static BOOL d3d_compile_shader(const char *hlsl, const char *entry,
     return TRUE;
 }
 
+/* (Re)create the GPU-side frame texture + SRV at the given size. Window thread only. */
+static BOOL d3d_create_frame_texture(VmDisplayIdd *d, UINT width, UINT height)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    HRESULT hr;
+
+    if (width == 0 || height == 0) return FALSE;
+
+    if (d->frame_srv) { d->frame_srv->lpVtbl->Release(d->frame_srv); d->frame_srv = NULL; }
+    if (d->frame_tex) { d->frame_tex->lpVtbl->Release(d->frame_tex); d->frame_tex = NULL; }
+    d->tex_width = d->tex_height = 0;
+
+    ZeroMemory(&td, sizeof(td));
+    td.Width              = width;
+    td.Height             = height;
+    td.MipLevels          = 1;
+    td.ArraySize          = 1;
+    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count   = 1;
+    td.Usage              = D3D11_USAGE_DYNAMIC;
+    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
+
+    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->frame_tex);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateTexture2D %ux%u failed (0x%08X)", width, height, hr);
+        return FALSE;
+    }
+
+    ZeroMemory(&srv_desc, sizeof(srv_desc));
+    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels       = 1;
+    srv_desc.Texture2D.MostDetailedMip = 0;
+
+    hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
+            (ID3D11Resource *)d->frame_tex, &srv_desc, &d->frame_srv);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateShaderResourceView failed (0x%08X)", hr);
+        d->frame_tex->lpVtbl->Release(d->frame_tex); d->frame_tex = NULL;
+        return FALSE;
+    }
+
+    d->tex_width  = width;
+    d->tex_height = height;
+    return TRUE;
+}
+
 static BOOL d3d_init(VmDisplayIdd *d)
 {
     DXGI_SWAP_CHAIN_DESC scd;
     D3D_FEATURE_LEVEL feature_level;
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
     D3D11_SAMPLER_DESC sd;
     ID3DBlob *vs_blob = NULL;
     ID3DBlob *ps_blob = NULL;
     HRESULT hr;
 
-    /* Create device and swap chain */
-    ZeroMemory(&scd, sizeof(scd));
-    scd.BufferCount                        = 1;
-    scd.BufferDesc.Width                   = DEFAULT_WIDTH;
-    scd.BufferDesc.Height                  = DEFAULT_HEIGHT;
-    scd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM;
-    scd.BufferDesc.RefreshRate.Numerator   = 60;
-    scd.BufferDesc.RefreshRate.Denominator = 1;
-    scd.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scd.OutputWindow                       = d->render_hwnd;
-    scd.SampleDesc.Count                   = 1;
-    scd.Windowed                           = TRUE;
-    scd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
+    /* Create device and swap chain. Prefer the flip model (FLIP_DISCARD, two
+       buffers) with ALLOW_TEARING when the OS supports it: Present(0, ALLOW_TEARING)
+       then never blocks on the host monitor's vblank, so a 144/240 Hz guest stream
+       is shown as fast as it arrives instead of being throttled by the host
+       compositor. Fall back to the legacy bitblt chain if flip creation fails. */
+    {
+        RECT crc;
+        UINT cw, ch;
+        GetClientRect(d->render_hwnd, &crc);
+        cw = (UINT)(crc.right  > 0 ? crc.right  : (LONG)DEFAULT_WIDTH);
+        ch = (UINT)(crc.bottom > 0 ? crc.bottom : (LONG)DEFAULT_HEIGHT);
 
-    hr = D3D11CreateDeviceAndSwapChain(
-        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
-        NULL, 0, D3D11_SDK_VERSION,
-        &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
+        d->allow_tearing = FALSE;
+        {
+            IDXGIFactory5 *f5 = NULL;
+            if (SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory5, (void **)&f5)) && f5) {
+                BOOL tearing = FALSE;
+                if (SUCCEEDED(f5->lpVtbl->CheckFeatureSupport(f5,
+                        DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing))))
+                    d->allow_tearing = tearing ? TRUE : FALSE;
+                f5->lpVtbl->Release(f5);
+            }
+        }
 
-    if (FAILED(hr)) {
-        ui_log(L"IDD: D3D11CreateDeviceAndSwapChain failed (0x%08X)", hr);
-        return FALSE;
+        ZeroMemory(&scd, sizeof(scd));
+        scd.BufferCount                        = 2;
+        scd.BufferDesc.Width                   = cw;
+        scd.BufferDesc.Height                  = ch;
+        scd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM;
+        scd.BufferDesc.RefreshRate.Numerator   = 0;   /* windowed: unused */
+        scd.BufferDesc.RefreshRate.Denominator = 1;
+        scd.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        scd.OutputWindow                       = d->render_hwnd;
+        scd.SampleDesc.Count                   = 1;
+        scd.Windowed                           = TRUE;
+        scd.SwapEffect                         = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        scd.Flags                              = d->allow_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+
+        hr = D3D11CreateDeviceAndSwapChain(
+            NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+            NULL, 0, D3D11_SDK_VERSION,
+            &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
+        d->flip_model = SUCCEEDED(hr);
+
+        if (FAILED(hr)) {
+            /* Same description, legacy bitblt: only the buffer count, swap effect
+               and flags differ from the flip-model attempt above. */
+            ui_log(L"IDD: flip-model swap chain failed (0x%08X), falling back to bitblt", hr);
+            d->allow_tearing = FALSE;
+            scd.BufferCount = 1;
+            scd.SwapEffect  = DXGI_SWAP_EFFECT_DISCARD;
+            scd.Flags       = 0;
+
+            hr = D3D11CreateDeviceAndSwapChain(
+                NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+                NULL, 0, D3D11_SDK_VERSION,
+                &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
+        }
+
+        if (FAILED(hr)) {
+            ui_log(L"IDD: D3D11CreateDeviceAndSwapChain failed (0x%08X)", hr);
+            return FALSE;
+        }
+        idd_log(d, L"D3D11 swap chain: %s%s", d->flip_model ? L"flip-discard" : L"bitblt",
+                d->allow_tearing ? L" + allow-tearing" : L"");
     }
 
     /* Create render target view from back buffer */
@@ -1099,37 +1301,10 @@ static BOOL d3d_init(VmDisplayIdd *d)
         }
     }
 
-    /* Create frame texture (dynamic, CPU-writable) */
-    ZeroMemory(&td, sizeof(td));
-    td.Width              = DEFAULT_WIDTH;
-    td.Height             = DEFAULT_HEIGHT;
-    td.MipLevels          = 1;
-    td.ArraySize          = 1;
-    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count   = 1;
-    td.Usage              = D3D11_USAGE_DYNAMIC;
-    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
-    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
-
-    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->frame_tex);
-    if (FAILED(hr)) {
-        ui_log(L"IDD: CreateTexture2D failed (0x%08X)", hr);
+    /* Create frame texture (dynamic, CPU-writable) at the current frame size.
+       Recreated by d3d_render_frame whenever the guest changes mode. */
+    if (!d3d_create_frame_texture(d, d->frame_width, d->frame_height))
         return FALSE;
-    }
-
-    /* Shader resource view for the frame texture */
-    ZeroMemory(&srv_desc, sizeof(srv_desc));
-    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
-    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srv_desc.Texture2D.MipLevels       = 1;
-    srv_desc.Texture2D.MostDetailedMip = 0;
-
-    hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
-            (ID3D11Resource *)d->frame_tex, &srv_desc, &d->frame_srv);
-    if (FAILED(hr)) {
-        ui_log(L"IDD: CreateShaderResourceView failed (0x%08X)", hr);
-        return FALSE;
-    }
 
     /* Compile and create vertex shader */
     if (!d3d_compile_shader(g_vs_hlsl, "main", "vs_4_0", &vs_blob))
@@ -1197,7 +1372,8 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d)
 
     hr = d->swap_chain->lpVtbl->ResizeBuffers(d->swap_chain, 0,
             (UINT)rc.right, (UINT)rc.bottom,
-            DXGI_FORMAT_UNKNOWN, 0);
+            DXGI_FORMAT_UNKNOWN,
+            d->allow_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     if (FAILED(hr)) {
         ui_log(L"IDD: ResizeBuffers failed (0x%08X)", hr);
         return;
@@ -1227,6 +1403,18 @@ static void d3d_render_frame(VmDisplayIdd *d)
     /* Upload frame data to GPU texture if dirty */
     if (d->frame_dirty) {
         EnterCriticalSection(&d->frame_cs);
+
+        /* Guest changed mode (the recv thread reallocated frame_buf): recreate the
+           GPU texture at the new size before uploading. */
+        if (d->frame_width != d->tex_width || d->frame_height != d->tex_height) {
+            if (!d3d_create_frame_texture(d, d->frame_width, d->frame_height)) {
+                d->frame_dirty = FALSE;
+                LeaveCriticalSection(&d->frame_cs);
+                return;
+            }
+            idd_log(d, L"GPU frame texture resized to %ux%u.", d->tex_width, d->tex_height);
+        }
+
         hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
                 D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1238,7 +1426,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
             if (copy_stride > d->frame_stride)
                 copy_stride = d->frame_stride;
 
-            for (row = 0; row < d->frame_height && row < DEFAULT_HEIGHT; row++) {
+            for (row = 0; row < d->frame_height && row < d->tex_height; row++) {
                 memcpy((BYTE *)mapped.pData + row * mapped.RowPitch,
                        d->frame_buf + row * d->frame_stride,
                        copy_stride);
@@ -1249,6 +1437,15 @@ static void d3d_render_frame(VmDisplayIdd *d)
         d->frame_dirty = FALSE;
         LeaveCriticalSection(&d->frame_cs);
         frame_uploaded = TRUE;
+    }
+
+    /* First frame at a new size: fit the window to it (once per size). */
+    if (frame_uploaded && d->hwnd &&
+        (d->frame_width != d->fit_width || d->frame_height != d->fit_height)) {
+        idd_fit_window_to_frame(d, d->frame_width, d->frame_height);
+        /* The fit dispatched WM_SIZE -> d3d_resize_swap_chain synchronously; if
+           that failed the render target is gone until the next resize. */
+        if (!d->rtv) return;
     }
 
     /* Compute letterboxed viewport within client area */
@@ -1266,13 +1463,20 @@ static void d3d_render_frame(VmDisplayIdd *d)
         vp.MaxDepth = 1.0f;
     }
 
-    /* Refresh the title once per uploaded frame (~frame rate). */
+    /* Refresh the title a couple of times a second (mode + delivered fps). Doing
+       it per frame would be hundreds of cross-thread SetWindowText calls per
+       second on a 240 Hz guest. */
     if (frame_uploaded && d->hwnd) {
-        wchar_t title[256];
-        swprintf_s(title, 256, L"%s%s Display %ux%u recv=%u",
-                   d->audio_muted ? L"\U0001F507 " : L"",
-                   d->vm_name, d->frame_width, d->frame_height, d->recv_count);
-        SetWindowTextW(d->hwnd, title);
+        ULONGLONG now = GetTickCount64();
+        if (now - d->title_tick >= TITLE_REFRESH_MS) {
+            wchar_t title[256];
+            d->title_tick = now;
+            swprintf_s(title, 256, L"%s%s Display %ux%u @ %u fps (configured %u Hz)",
+                       d->audio_muted ? L"\U0001F507 " : L"",
+                       d->vm_name, d->frame_width, d->frame_height, d->recv_fps,
+                       d->cfg_hz ? d->cfg_hz : 60);
+            SetWindowTextW(d->hwnd, title);
+        }
     }
     d->render_count++;
 
@@ -1292,7 +1496,11 @@ static void d3d_render_frame(VmDisplayIdd *d)
     /* Draw fullscreen triangle (3 vertices, no vertex buffer) */
     d->ctx->lpVtbl->Draw(d->ctx, 3, 0);
 
-    d->swap_chain->lpVtbl->Present(d->swap_chain, 0, 0);
+    /* SyncInterval 0: never wait for the host vblank. With ALLOW_TEARING the
+       flip-model present also bypasses the compositor's frame queue, so the
+       host window can run faster than the host monitor's refresh rate. */
+    d->swap_chain->lpVtbl->Present(d->swap_chain, 0,
+            d->allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
 }
 
 static void d3d_cleanup(VmDisplayIdd *d)
@@ -1520,11 +1728,19 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     WSADATA wsa;
     BYTE *recv_buf = NULL;
+    SIZE_T recv_cap = 0;
+    ULONGLONG fps_tick = GetTickCount64();
+    UINT fps_frames = 0;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    /* Allocate receive buffer for frame pixel data */
-    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MAX_FRAME_DATA_SIZE);
+    /* Allocate receive buffer for frame pixel data, sized for the frame we expect
+       (the VM's configured mode); grown on demand up to MAX_FRAME_DATA_SIZE when
+       the guest sends a larger frame. */
+    recv_cap = (SIZE_T)d->frame_stride * d->frame_height;
+    if (recv_cap < (SIZE_T)DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+        recv_cap = (SIZE_T)DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;
+    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, recv_cap);
     if (!recv_buf) {
         ui_log(L"IDD recv: failed to allocate receive buffer");
         return 1;
@@ -1702,6 +1918,16 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 idd_log(d, L"Frame data too large (%u bytes), reconnecting.", data_size);
                 break;
             }
+            if ((SIZE_T)data_size > recv_cap) {
+                BYTE *nb = (BYTE *)HeapReAlloc(GetProcessHeap(), 0, recv_buf, data_size);
+                if (!nb) {
+                    idd_log(d, L"Cannot grow receive buffer to %u bytes, reconnecting.", data_size);
+                    break;
+                }
+                recv_buf = nb;
+                recv_cap = data_size;
+                idd_log(d, L"Receive buffer grown to %u bytes.", data_size);
+            }
 
             /* Read pixel data */
             if (data_size > 0) {
@@ -1793,9 +2019,26 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             d->recv_count++;
             LeaveCriticalSection(&d->frame_cs);
 
-            /* Signal the window thread to repaint */
-            if (d->hwnd && IsWindow(d->hwnd))
-                PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0);
+            /* Delivered-fps meter (1 s window), shown in the window title */
+            fps_frames++;
+            {
+                ULONGLONG now = GetTickCount64();
+                if (now - fps_tick >= 1000) {
+                    d->recv_fps = (UINT)((ULONGLONG)fps_frames * 1000 / (now - fps_tick));
+                    fps_frames = 0;
+                    fps_tick = now;
+                }
+            }
+
+            /* Signal the window thread to repaint. Coalesce: at most one
+               WM_IDD_FRAME_READY in flight, so a fast guest (240 Hz) can never
+               back up the message queue; the handler always renders the newest
+               frame_buf contents anyway. */
+            if (d->hwnd && IsWindow(d->hwnd) &&
+                InterlockedCompareExchange(&d->frame_posted, 1, 0) == 0) {
+                if (!PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0))
+                    InterlockedExchange(&d->frame_posted, 0);
+            }
 
             /* Reconnect input socket if send_input flagged it dead */
             if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
@@ -1875,11 +2118,20 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
 
-    /* Compute outer window size so the client area is exactly 1920x1080 */
+    /* Compute outer window size so the client area matches the VM's configured
+       display mode (1:1 pixels), shrunk to fit the primary work area if the guest
+       mode is larger than the host desktop (letterboxing keeps the aspect). */
     {
         DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
         DWORD exstyle = 0;
-        RECT wr = { 0, 0, 1920, 1080 };
+        RECT wr = { 0, 0, 0, 0 };
+        UINT cw = d->cfg_width  ? d->cfg_width  : DEFAULT_WIDTH;
+        UINT ch = d->cfg_height ? d->cfg_height : DEFAULT_HEIGHT;
+        idd_clamp_client_to_work_area(style, exstyle, &cw, &ch);
+        wr.right  = (LONG)cw;
+        wr.bottom = (LONG)ch;
+        d->fit_width  = d->cfg_width  ? d->cfg_width  : DEFAULT_WIDTH;   /* frame size this window is sized for */
+        d->fit_height = d->cfg_height ? d->cfg_height : DEFAULT_HEIGHT;
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
 
         d->hwnd = CreateWindowExW(
@@ -1911,6 +2163,26 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
+
+            /* Display mode ▸ (resolution @ refresh). Applies live: the core pushes the
+               mode to the guest agent, which restarts the guest display driver. */
+            {
+                HMENU modes = CreatePopupMenu();
+                if (modes) {
+                    UINT i;
+                    for (i = 0; i < DISPLAY_PRESET_COUNT; i++) {
+                        wchar_t label[64];
+                        swprintf_s(label, 64, L"%u \u00D7 %u @ %u Hz",
+                                   g_display_presets[i].w, g_display_presets[i].h, g_display_presets[i].hz);
+                        AppendMenuW(modes, MF_STRING, IDM_DISPLAY_MODE_BASE + 0x10 * i, label);
+                    }
+                    AppendMenuW(modes, MF_SEPARATOR, 0, NULL);
+                    AppendMenuW(modes, MF_STRING, IDM_DISPLAY_MODE_LIST,
+                                L"Let the guest choose other modes (Display Settings)");
+                    AppendMenuW(sysmenu, MF_POPUP, (UINT_PTR)modes, L"Display mode");
+                    idd_sync_display_mode_menu(d);
+                }
+            }
         }
     }
 
@@ -2065,6 +2337,26 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         : L"Transmit Keyboard Hotkeys: OFF.");
             return 0;
         }
+        if (d && d->vm && (wp & 0xFFF0) >= IDM_DISPLAY_MODE_BASE && (wp & 0xFFF0) <= IDM_DISPLAY_MODE_LAST) {
+            UINT i = (UINT)(((wp & 0xFFF0) - IDM_DISPLAY_MODE_BASE) / 0x10);
+            if (i < DISPLAY_PRESET_COUNT) {
+                idd_log(d, L"Display mode requested: %u\u00D7%u @ %u Hz (guest display driver restarts).",
+                        g_display_presets[i].w, g_display_presets[i].h, g_display_presets[i].hz);
+                asb_vm_set_display((AsbVm)d->vm, (int)g_display_presets[i].w,
+                                   (int)g_display_presets[i].h, (int)g_display_presets[i].hz, -1);
+                d->cfg_width  = g_display_presets[i].w;
+                d->cfg_height = g_display_presets[i].h;
+                d->cfg_hz     = g_display_presets[i].hz;
+                idd_sync_display_mode_menu(d);
+            }
+            return 0;
+        }
+        if (d && d->vm && (wp & 0xFFF0) == IDM_DISPLAY_MODE_LIST) {
+            BOOL on = !asb_vm_display_mode_list((AsbVm)d->vm);
+            asb_vm_set_display((AsbVm)d->vm, 0, 0, 0, on ? 1 : 0);
+            idd_sync_display_mode_menu(d);
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_SHOW_LOG) {
             /* Reveal the log window (hidden by default). Closing it via its
                own [X] just hides it again (see idd_log_proc WM_CLOSE), so
@@ -2200,7 +2492,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_IDD_FRAME_READY:
-        if (d) d3d_render_frame(d);
+        if (d) {
+            InterlockedExchange(&d->frame_posted, 0);
+            d3d_render_frame(d);
+        }
         return 0;
 
     case WM_CLIPBOARDUPDATE:
@@ -2387,10 +2682,17 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
        installed later, on the window thread, once the window exists. */
     d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path);
 
-    /* Initialize frame buffer at default resolution */
-    d->frame_width  = DEFAULT_WIDTH;
-    d->frame_height = DEFAULT_HEIGHT;
-    d->frame_stride = DEFAULT_WIDTH * 4;
+    /* Initialize frame buffer at the VM's configured display mode (falls back to
+       1920x1080 for VMs created before the setting existed). The guest's real
+       mode arrives in every frame header and overrides this. */
+    d->cfg_width  = (vm->display_width  > 0) ? (UINT)vm->display_width  : DEFAULT_WIDTH;
+    d->cfg_height = (vm->display_height > 0) ? (UINT)vm->display_height : DEFAULT_HEIGHT;
+    d->cfg_hz     = (vm->display_hz     > 0) ? (UINT)vm->display_hz     : 60;
+    if (d->cfg_width  > MAX_FRAME_WIDTH)  d->cfg_width  = MAX_FRAME_WIDTH;
+    if (d->cfg_height > MAX_FRAME_HEIGHT) d->cfg_height = MAX_FRAME_HEIGHT;
+    d->frame_width  = d->cfg_width;
+    d->frame_height = d->cfg_height;
+    d->frame_stride = d->cfg_width * 4;
     d->frame_buf    = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                          d->frame_stride * d->frame_height);
     if (!d->frame_buf) {

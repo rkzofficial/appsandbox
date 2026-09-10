@@ -112,12 +112,35 @@ void asb_build_edid(struct asb_device *asb)
 	/* Standard timings — all "unused" markers */
 	for (i = 38; i <= 53; i++) e[i] = 0x01;
 
-	/* DTD #1 (bytes 54..71): the preferred mode, computed from CVT. */
+	/* DTD #1 (bytes 54..71): the preferred mode, computed from CVT. The DTD
+	 * pixel-clock field is 16 bits of 10 kHz, i.e. 655.35 MHz max. High
+	 * refresh rates at 1440p/4K exceed that (2560x1440@240 CVT ~1.3 GHz),
+	 * so try reduced blanking first and, if still too fast, describe the
+	 * same resolution at 60 Hz here: the DTD is descriptive only, the real
+	 * mode list (including the high-refresh preferred mode) is what
+	 * asb_connector_get_modes() publishes. */
 	{
 		struct drm_display_mode *cvt = drm_cvt_mode(NULL, asb->width,
 		                                            asb->height,
 		                                            asb->refresh,
 		                                            false, false, false);
+		if (cvt && cvt->clock / 10 > 0xffff) {
+			drm_mode_destroy(NULL, cvt);
+			cvt = drm_cvt_mode(NULL, asb->width, asb->height,
+			                   asb->refresh, true, false, false);
+		}
+		if (cvt && cvt->clock / 10 > 0xffff) {
+			drm_mode_destroy(NULL, cvt);
+			cvt = drm_cvt_mode(NULL, asb->width, asb->height,
+			                   60, true, false, false);
+		}
+		if (cvt && cvt->clock / 10 > 0xffff) {
+			/* Even 60 Hz reduced-blanking does not fit (8K): leave DTD #1 as
+			 * a dummy descriptor rather than write a wrapped pixel clock. */
+			drm_mode_destroy(NULL, cvt);
+			cvt = NULL;
+			e[54] = e[55] = e[56] = 0; e[57] = 0x10; e[58] = 0;
+		}
 		if (cvt) {
 			m = *cvt;
 			drm_mode_destroy(NULL, cvt);
@@ -131,13 +154,23 @@ void asb_build_edid(struct asb_device *asb)
 		e[77 + i] = name[i];
 	for (; i < 13; i++) e[77 + i] = (i == strlen(name)) ? 0x0a : 0x20;
 
-	/* Descriptor #3 (90..107) — range limits (0xFD) */
-	e[90] = e[91] = e[92] = 0; e[93] = 0xfd; e[94] = 0;
-	e[95] = 24;        /* min vertical Hz */
-	e[96] = 75;        /* max vertical Hz */
-	e[97] = 30;        /* min horizontal kHz */
-	e[98] = 150;       /* max horizontal kHz */
-	e[99] = 220;       /* max pixel clock / 10 MHz → 2200 MHz cap */
+	/* Descriptor #3 (90..107) — range limits (0xFD). Wide enough for the
+	 * whole module-param range (up to 4K @ 240+ Hz): EDID 1.4 rate bytes
+	 * are 1..255, so values above 255 use the byte-94 "+255 offset" flags
+	 * (bits 1:0 vertical max, bits 3:2 horizontal max). */
+	{
+		unsigned int vmax = asb->refresh > 240 ? asb->refresh : 240;
+		unsigned int hmax = 400;               /* kHz: 4K @ 240 Hz needs ~560 with CVT-RB */
+		u8 flags = 0;
+		if (vmax > 255) { vmax -= 255; flags |= 0x02; }
+		if (hmax > 255) { hmax -= 255; flags |= 0x08; }
+		e[90] = e[91] = e[92] = 0; e[93] = 0xfd; e[94] = flags;
+		e[95] = 24;             /* min vertical Hz */
+		e[96] = (u8)vmax;       /* max vertical Hz (+255 if flagged) */
+		e[97] = 15;             /* min horizontal kHz */
+		e[98] = (u8)hmax;       /* max horizontal kHz (+255 if flagged) */
+		e[99] = 255;            /* max pixel clock / 10 MHz → 2550 MHz */
+	}
 	e[100] = 0x0a;
 	for (i = 101; i <= 107; i++) e[i] = 0x20;
 
@@ -174,22 +207,42 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 		count++;
 	}
 
-	/* Common fallbacks. Mutter typically ignores these unless the user
-	 * explicitly switches resolution, but they're cheap to publish. */
+	/* Extra modes the guest may switch to from its Display Settings: the
+	 * native resolution at other common refresh rates, plus common lower
+	 * resolutions. Deduplicated against the preferred mode on the full
+	 * (w, h, hz) triple so e.g. a 1440p@240 preferred mode keeps its 60 Hz
+	 * sibling in the list. */
 	{
+		static const int native_hz[] = { 60, 120, 144, 240 };
 		static const struct { int w, h, hz; } fallbacks[] = {
+			{ 3840, 2160, 60 },
 			{ 2560, 1440, 60 },
 			{ 1920, 1200, 60 },
+			{ 1920, 1080, 60 },
 			{ 1680, 1050, 60 },
 			{ 1280,  720, 60 },
 			{ 1024,  768, 60 },
 		};
 		size_t i;
 
+		for (i = 0; i < ARRAY_SIZE(native_hz); i++) {
+			if (native_hz[i] == (int)asb->refresh)
+				continue;
+			m = drm_cvt_mode(connector->dev, asb->width, asb->height,
+			                 native_hz[i], false, false, false);
+			if (m) {
+				m->type |= DRM_MODE_TYPE_DRIVER;
+				drm_mode_probed_add(connector, m);
+				count++;
+			}
+		}
 		for (i = 0; i < ARRAY_SIZE(fallbacks); i++) {
 			if (fallbacks[i].w == (int)asb->width &&
 			    fallbacks[i].h == (int)asb->height)
-				continue;
+				continue;   /* native resolution: covered by native_hz above */
+			if (fallbacks[i].w > (int)asb->width ||
+			    fallbacks[i].h > (int)asb->height)
+				continue;   /* never advertise more pixels than configured */
 			m = drm_cvt_mode(connector->dev,
 			                 fallbacks[i].w, fallbacks[i].h,
 			                 fallbacks[i].hz,

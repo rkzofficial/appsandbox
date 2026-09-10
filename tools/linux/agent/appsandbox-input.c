@@ -38,6 +38,8 @@
 #include <sys/types.h>
 #include <linux/uinput.h>
 #include <linux/vm_sockets.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
 
 #define VSOCK_PORT          3
 #define INPUT_MAGIC         0x4E495341u  /* 'ASIN' */
@@ -67,8 +69,64 @@ struct input_packet {
 #pragma pack(pop)
 
 static volatile sig_atomic_t g_stop = 0;
-static int g_frame_w = 1920;  /* updated by hint command if we add one later */
+/* Guest framebuffer size the host's absolute mouse coordinates refer to. The
+ * host sends INPUT_MOUSE_MOVE in guest pixels of the frame it is showing, so
+ * this must track the committed DRM mode (asb_drm's configured mode, or what
+ * the user picked in Display Settings). Re-read from DRM on every host connect
+ * and periodically while serving; 1920x1080 is only the pre-DRM fallback. */
+static int g_frame_w = 1920;
 static int g_frame_h = 1080;
+
+/* Read the active CRTC mode of the first connected connector on any DRM card
+ * (asb_drm is the only card once simpledrm is blacklisted). Returns 0 and fills
+ * w/h on success, -1 if nothing is committed yet. */
+static int drm_query_active_mode(int *w, int *h)
+{
+    for (int i = 0; i < 8; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/dev/dri/card%d", i);
+        int fd = open(path, O_RDWR | O_CLOEXEC);
+        if (fd < 0) continue;
+        drmDropMaster(fd);                 /* never hold DRM master away from the compositor */
+        drmModeRes *res = drmModeGetResources(fd);
+        int found = -1;
+        if (res) {
+            for (int k = 0; k < res->count_connectors && found < 0; k++) {
+                drmModeConnector *con = drmModeGetConnector(fd, res->connectors[k]);
+                if (!con) continue;
+                if (con->connection == DRM_MODE_CONNECTED && con->encoder_id) {
+                    drmModeEncoder *enc = drmModeGetEncoder(fd, con->encoder_id);
+                    if (enc && enc->crtc_id) {
+                        drmModeCrtc *crtc = drmModeGetCrtc(fd, enc->crtc_id);
+                        if (crtc && crtc->mode_valid && crtc->mode.hdisplay && crtc->mode.vdisplay) {
+                            *w = crtc->mode.hdisplay;
+                            *h = crtc->mode.vdisplay;
+                            found = 0;
+                        }
+                        if (crtc) drmModeFreeCrtc(crtc);
+                    }
+                    if (enc) drmModeFreeEncoder(enc);
+                }
+                drmModeFreeConnector(con);
+            }
+            drmModeFreeResources(res);
+        }
+        close(fd);
+        if (found == 0) return 0;
+    }
+    return -1;
+}
+
+/* Re-read the committed mode; returns 1 if the frame size changed, else 0. */
+static int refresh_frame_size(void)
+{
+    int w = 0, h = 0;
+    if (drm_query_active_mode(&w, &h) != 0) return 0;
+    if (w == g_frame_w && h == g_frame_h) return 0;
+    g_frame_w = w;
+    g_frame_h = h;
+    return 1;
+}
 
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
@@ -318,6 +376,13 @@ static int recv_exact(int fd, void *buf, size_t len)
 
 static void serve(int client_fd, int ui_fd)
 {
+    time_t last_mode_check;
+
+    /* Map host coordinates against the mode the compositor is really running. */
+    (void)refresh_frame_size();
+    last_mode_check = time(NULL);
+    in_log("frame size %dx%d", g_frame_w, g_frame_h);
+
     /* Tell the host the guest is ready. */
     uint32_t ready = INPUT_READY_MAGIC;
     if (send(client_fd, &ready, sizeof(ready), MSG_NOSIGNAL) != sizeof(ready)) {
@@ -327,6 +392,12 @@ static void serve(int client_fd, int ui_fd)
 
     while (!g_stop) {
         struct input_packet pkt;
+        time_t now = time(NULL);
+        if (now - last_mode_check >= 2) {   /* cheap: a handful of ioctls, at most every 2 s (checked per packet) */
+            if (refresh_frame_size())
+                in_log("frame size changed to %dx%d", g_frame_w, g_frame_h);
+            last_mode_check = now;
+        }
         if (recv_exact(client_fd, &pkt, sizeof(pkt)) < 0) break;
         if (pkt.magic != INPUT_MAGIC) {
             in_log("bad magic 0x%08x — desync, closing", pkt.magic);

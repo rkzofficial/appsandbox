@@ -429,6 +429,62 @@ function onNetModeChange() {
 }
 onNetModeChange();
 
+/* ---- Display mode (resolution @ refresh) ---- */
+
+var DISPLAY_PRESETS = ['1920x1080@60', '1920x1080@120', '1920x1080@144', '1920x1080@240',
+                       '2560x1440@60', '2560x1440@120', '2560x1440@144', '2560x1440@165', '2560x1440@240',
+                       '3440x1440@144', '3840x2160@60', '3840x2160@120'];
+
+function parseDisplayMode(str) {
+    var m = /^(\d+)x(\d+)(?:@(\d+))?$/.exec(String(str || '').trim());
+    if (!m) return null;
+    return { w: parseInt(m[1], 10), h: parseInt(m[2], 10), hz: m[3] ? parseInt(m[3], 10) : 60 };
+}
+
+function formatDisplayMode(w, h, hz) {
+    return w + '\u00D7' + h + ' @ ' + hz + ' Hz';
+}
+
+function displayModeValid(m) {
+    return m && m.w >= 640 && m.w <= 7680 && m.h >= 480 && m.h <= 4320 &&
+           m.w % 2 === 0 && m.h % 2 === 0 && m.hz >= 24 && m.hz <= 500;
+}
+
+/* Fill the create-form preset dropdown from DISPLAY_PRESETS so the list is
+   defined once (index.html carries only the Custom entry). */
+function populateDisplayPresets() {
+    var sel = document.getElementById('display-mode');
+    if (!sel) return;
+    var html = '';
+    for (var i = 0; i < DISPLAY_PRESETS.length; i++) {
+        var m = parseDisplayMode(DISPLAY_PRESETS[i]);
+        html += '<option value="' + DISPLAY_PRESETS[i] + '">' + formatDisplayMode(m.w, m.h, m.hz) + '</option>';
+    }
+    sel.innerHTML = html + '<option value="custom">Custom\u2026</option>';
+    sel.value = '1920x1080@60';
+}
+populateDisplayPresets();
+
+function onDisplayModeChange() {
+    var custom = document.getElementById('display-mode').value === 'custom';
+    document.getElementById('display-custom').style.display = custom ? '' : 'none';
+}
+
+/* The create form's display mode as {w,h,hz}; falls back to 1080p60 on bad input. */
+function gatherDisplayMode() {
+    var sel = document.getElementById('display-mode').value;
+    var m;
+    if (sel === 'custom') {
+        m = { w: parseInt(document.getElementById('display-width').value, 10),
+              h: parseInt(document.getElementById('display-height').value, 10),
+              hz: parseInt(document.getElementById('display-hz').value, 10) };
+    } else {
+        m = parseDisplayMode(sel);
+    }
+    if (!displayModeValid(m)) m = { w: 1920, h: 1080, hz: 60 };
+    return m;
+}
+
 /* ---- Create VM ---- */
 
 function gatherConfig() {
@@ -436,6 +492,7 @@ function gatherConfig() {
     /* Same ISO-picker path for Windows and Linux. The cloud-image
        Linux-version dropdown is dormant (see applyOsTypeUI). */
     var imagePath = document.getElementById('image-path').value.trim();
+    var displayMode = gatherDisplayMode();
     return {
         name:        document.getElementById('vm-name').value.trim(),
         osType:      osType,
@@ -446,6 +503,10 @@ function gatherConfig() {
         cpuCores:    parseInt(document.getElementById('cpu-cores').value) || 8,
         gpuMode:     parseInt(document.getElementById('gpu-mode').value),
         networkMode: parseInt(document.getElementById('net-mode').value),
+        displayWidth:  displayMode.w,
+        displayHeight: displayMode.h,
+        displayHz:     displayMode.hz,
+        displayModeList: document.getElementById('display-mode-list').checked,
         netAdapter:  document.getElementById('net-adapter').value,
         adminUser:   document.getElementById('admin-user').value.trim(),
         adminPass:   document.getElementById('admin-pass').value,
@@ -586,6 +647,9 @@ function openCreateModal() {
     selectTemplate('', templateDefaultLabel());
     document.getElementById('hdd-size').value = 64;
     document.getElementById('gpu-mode').value = '1';
+    document.getElementById('display-mode').value = '1920x1080@60';
+    document.getElementById('display-mode-list').checked = false;
+    onDisplayModeChange();
     document.getElementById('net-mode').value = '1';
     document.getElementById('admin-user').value = 'user';
     document.getElementById('admin-pass').value = 'test123';
@@ -747,6 +811,8 @@ function buildRowCells(vm, i, statusTd) {
         makeCell(vm.hddGb + ' GB', i, 6, 'Virtual disk size, in gigabytes'),
         makeCell(vm.gpuName || (vm.gpuMode === 2 ? 'Try all' : vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7, 'GPU passed through to the VM via GPU-PV, or None'),
         makeCell(netNames[vm.networkMode] || 'None', i, 8, 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
+        makeCell(formatDisplayMode(vm.displayWidth || 1920, vm.displayHeight || 1080, vm.displayHz || 60), i, 9,
+                 'Guest display mode (resolution @ refresh rate). Editable any time, including while the VM is running: the guest display driver is reconfigured live.'),
     ];
     if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
     cells.push(
@@ -775,7 +841,7 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
-        makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld, function() { toggleEditMode(i); }, '', 'Edit VM configuration (CPU, RAM, GPU, network) — VM must be stopped'),
+        makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !bld, function() { toggleEditMode(i); }, '', vm.running ? 'Edit the display mode (other settings need the VM stopped)' : 'Edit VM configuration (CPU, RAM, GPU, network, display)'),
     );
     return cells;
 }
@@ -789,7 +855,7 @@ function renderVmTable() {
         tbody.innerHTML = '';
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = hostBridge.isMac ? 16 : 17;
+        td.colSpan = hostBridge.isMac ? 17 : 18;
         td.className = 'empty-state';
         var btn = document.createElement('button');
         btn.className = 'primary empty-state-btn';
@@ -841,6 +907,7 @@ function renderVmTable() {
             vm.sshEnabled, vm.sshState, vm.sshPort,
             vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuName, vm.networkMode,
+            vm.displayWidth, vm.displayHeight, vm.displayHz, vm.displayModeList,
             selectedSnap[i] || 'current',
             /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
                so makeSnapCell re-runs. These fields only change on user snapshot
@@ -889,8 +956,10 @@ function makeCell(text, row, col, title) {
     td.textContent = text;
     if (title) td.title = title;
 
-    /* Editable columns: 4=CPU, 5=RAM, 7=GPU, 8=Network */
-    if (editModeRow === row && (col === 4 || col === 5 || col === 7 || col === 8)) {
+    /* Editable columns: 4=CPU, 5=RAM, 7=GPU, 8=Network (stopped only); 9=Display (any time) */
+    var vmRow = vms[row];
+    var editable = (col === 9) || (vmRow && !vmRow.running && (col === 4 || col === 5 || col === 7 || col === 8));
+    if (editModeRow === row && editable) {
         td.style.cursor = 'pointer';
         td.title = 'Click to edit';
         td.onclick = function(e) {
@@ -936,7 +1005,8 @@ function toggleEditMode(row) {
 function startInlineEdit(row, col, td) {
     if (editingCell) commitInlineEdit();
     var vm = vms[row];
-    if (!vm || vm.running) return;
+    if (!vm) return;
+    if (vm.running && col !== 9) return;   /* only the display mode changes live */
 
     var oldValue;
     /* Lock cell width before swapping content to prevent column resize */
@@ -952,6 +1022,39 @@ function startInlineEdit(row, col, td) {
         sel.value = String(vm.gpuMode);
         sel.onclick = function(e) { e.stopPropagation(); };
         sel.onchange = function() { commitInlineEdit(); };
+        sel.onblur = function() { setTimeout(commitInlineEdit, 100); };
+        td.textContent = '';
+        td.appendChild(sel);
+        editingCell = { row: row, col: col, element: sel };
+        sel.focus();
+        setTimeout(function() { try { sel.showPicker(); } catch(e) {} }, 0);
+    } else if (col === 9) {
+        /* Display mode combo: presets + the current value + Custom (prompt) */
+        var cur = (vm.displayWidth || 1920) + 'x' + (vm.displayHeight || 1080) + '@' + (vm.displayHz || 60);
+        var sel = document.createElement('select');
+        var opts = DISPLAY_PRESETS.slice();
+        if (opts.indexOf(cur) < 0) opts.unshift(cur);
+        var html = '';
+        for (var oi = 0; oi < opts.length; oi++) {
+            var pm = parseDisplayMode(opts[oi]);
+            html += '<option value="' + opts[oi] + '">' + formatDisplayMode(pm.w, pm.h, pm.hz) + '</option>';
+        }
+        html += '<option value="custom">Custom\u2026</option>';
+        sel.innerHTML = html;
+        sel.value = cur;
+        sel.onclick = function(e) { e.stopPropagation(); };
+        sel.onchange = function() {
+            if (sel.value === 'custom') {
+                var entered = window.prompt('Display mode as WIDTHxHEIGHT@HZ (e.g. 2560x1440@240):', cur);
+                var pm2 = parseDisplayMode(entered);
+                if (!displayModeValid(pm2)) { cancelInlineEdit(); return; }
+                var v = pm2.w + 'x' + pm2.h + '@' + pm2.hz;
+                var o = document.createElement('option'); o.value = v; o.textContent = formatDisplayMode(pm2.w, pm2.h, pm2.hz);
+                sel.insertBefore(o, sel.firstChild);
+                sel.value = v;
+            }
+            commitInlineEdit();
+        };
         sel.onblur = function() { setTimeout(commitInlineEdit, 100); };
         td.textContent = '';
         td.appendChild(sel);
@@ -1002,6 +1105,7 @@ function commitInlineEdit() {
     else if (col === 5) field = 'ramMb';
     else if (col === 7) field = 'gpuMode';
     else if (col === 8) field = 'networkMode';
+    else if (col === 9) { field = 'displayMode'; if (value === 'custom' || !displayModeValid(parseDisplayMode(value))) field = null; }
 
     /* RAM must be 2 MB-aligned (HCS requirement): round an odd entry down by 1. */
     if (field === 'ramMb') {

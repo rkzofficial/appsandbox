@@ -28,13 +28,22 @@ static VZVirtioSoundDeviceConfiguration *BuildAudio(BOOL withInput) {
     return audio;
 }
 
-static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
+/* Guest display: width/height in pixels (0 = the historical 2560x1600 default).
+   pixelsPerInch is scaled so a 1080p-class guest gets ~1x UI and a 4K-class guest
+   ~2x, keeping the desktop legible whatever size is chosen. */
+static VZMacGraphicsDeviceConfiguration *BuildGraphicsSized(int width, int height) {
+    if (width <= 0 || height <= 0) { width = 2560; height = 1600; }
+    int ppi = (width >= 3000 || height >= 1800) ? 220 : (width >= 2300 ? 144 : 110);
     VZMacGraphicsDeviceConfiguration *gfx = [[VZMacGraphicsDeviceConfiguration alloc] init];
     gfx.displays = @[[[VZMacGraphicsDisplayConfiguration alloc]
-                          initWithWidthInPixels:2560
-                                 heightInPixels:1600
-                                  pixelsPerInch:144]];
+                          initWithWidthInPixels:(NSInteger)width
+                                 heightInPixels:(NSInteger)height
+                                  pixelsPerInch:(NSInteger)ppi]];
     return gfx;
+}
+
+static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
+    return BuildGraphicsSized(0, 0);
 }
 
 @implementation VzVm
@@ -133,6 +142,8 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
 + (VzVm *)loadVmNamed:(NSString *)name
                 ramMb:(int)ramMb
              cpuCores:(int)cpuCores
+         displayWidth:(int)displayWidth
+        displayHeight:(int)displayHeight
                 error:(NSError **)error {
     NSData *hwData = [NSData dataWithContentsOfURL:[VmDir hardwareModelURLFor:name]];
     NSData *midData = [NSData dataWithContentsOfURL:[VmDir machineIdentifierURLFor:name]];
@@ -175,7 +186,7 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
     config.platform = platform;
     config.bootLoader = [[VZMacOSBootLoader alloc] init];
     config.storageDevices = @[[[VZVirtioBlockDeviceConfiguration alloc] initWithAttachment:att]];
-    config.graphicsDevices = @[BuildGraphics()];
+    config.graphicsDevices = @[BuildGraphicsSized(displayWidth, displayHeight)];
     config.networkDevices = @[[VzNetwork natConfiguration]];
     config.pointingDevices = @[[[VZMacTrackpadConfiguration alloc] init],
                                 [[VZUSBScreenCoordinatePointingDeviceConfiguration alloc] init]];

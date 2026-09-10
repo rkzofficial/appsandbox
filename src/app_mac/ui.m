@@ -66,6 +66,10 @@ static NSDictionary *vmToJsDict(const AsbVmMac *vm) {
         @"gpuMode":         @(vm->gpu_mode),
         @"gpuName":         [HostInfo hostGpuName],
         @"networkMode":     @(vm->network_mode),
+        @"displayWidth":    @(vm->display_width  > 0 ? vm->display_width  : ASB_DISPLAY_DEFAULT_WIDTH),
+        @"displayHeight":   @(vm->display_height > 0 ? vm->display_height : ASB_DISPLAY_DEFAULT_HEIGHT),
+        @"displayHz":       @(vm->display_hz     > 0 ? vm->display_hz     : ASB_DISPLAY_DEFAULT_HZ),
+        @"displayModeList": @(vm->display_mode_list ? YES : NO),
         @"netAdapter":      @"",
         @"isTemplate":      @NO,
         @"hypervVideoOff":  @NO,
@@ -278,13 +282,18 @@ static void handleCreateVm(NSDictionary *msg) {
     int cpuCores        = [msg[@"cpuCores"] intValue];
     int gpuMode         = [msg[@"gpuMode"] intValue];
     int networkMode     = [msg[@"networkMode"] intValue];
+    int displayWidth    = [msg[@"displayWidth"] intValue];
+    int displayHeight   = [msg[@"displayHeight"] intValue];
+    int displayHz       = [msg[@"displayHz"] intValue];
+    BOOL displayModeList = [msg[@"displayModeList"] boolValue];
 
     const char *imagePath = (image.length > 0) ? [image UTF8String] : NULL;
     int rc = asb_mac_vm_create([name UTF8String], [osType UTF8String],
                                 ramMb, hddGb, cpuCores,
                                 gpuMode, networkMode, imagePath,
                                 [adminUser UTF8String], [adminPass UTF8String],
-                                sshEnabled, sshDeployKey, testMode);
+                                sshEnabled, sshDeployKey, testMode,
+                                displayWidth, displayHeight, displayHz, displayModeList);
     if (rc != 0) {
         sendAlert([NSString stringWithFormat:@"Create failed (error %d)", rc]);
     }

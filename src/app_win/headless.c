@@ -250,6 +250,7 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
         ",\"state\":\"%s\",\"running\":%s,\"agentOnline\":%s,\"installComplete\":%s,"
         "\"building\":%s,\"progress\":%d,\"sshState\":%d,\"sshPort\":%lu,"
         "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,\"gpuMode\":%d,\"networkMode\":%d,"
+        "\"displayWidth\":%d,\"displayHeight\":%d,\"displayHz\":%d,\"displayModeList\":%s,"
         "\"displayOpen\":%s}",
         derive_state(v),
         v->running ? "true" : "false", v->agent_online ? "true" : "false",
@@ -259,6 +260,10 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
         (unsigned long)v->ssh_port,
         (unsigned long)v->ram_mb, (unsigned long)v->hdd_gb, (unsigned long)v->cpu_cores,
         v->gpu_mode, v->network_mode,
+        v->display_width  > 0 ? v->display_width  : DISPLAY_DEFAULT_WIDTH,
+        v->display_height > 0 ? v->display_height : DISPLAY_DEFAULT_HEIGHT,
+        v->display_hz     > 0 ? v->display_hz     : DISPLAY_DEFAULT_HZ,
+        v->display_mode_list ? "true" : "false",
         display_is_open(v->unique_id) ? "true" : "false");
     return pos;
 }
@@ -662,6 +667,17 @@ static int handle_request(PHTTP_REQUEST req)
             if (json_get_int(body, L"cpuCores", &iv)) cfg.cpu_cores = (DWORD)iv;
             if (json_get_int(body, L"gpuMode", &iv)) cfg.gpu_mode = iv;
             if (json_get_int(body, L"networkMode", &iv)) cfg.network_mode = iv;
+            if (json_get_int(body, L"displayWidth", &iv))  cfg.display_width  = iv;
+            if (json_get_int(body, L"displayHeight", &iv)) cfg.display_height = iv;
+            if (json_get_int(body, L"displayHz", &iv))     cfg.display_hz     = iv;
+            if (json_get_bool(body, L"displayModeList", &bv)) cfg.display_mode_list = bv;
+            if (cfg.display_width || cfg.display_height || cfg.display_hz) {
+                const char *derr = asb_display_mode_validate(
+                    cfg.display_width  ? cfg.display_width  : DISPLAY_DEFAULT_WIDTH,
+                    cfg.display_height ? cfg.display_height : DISPLAY_DEFAULT_HEIGHT,
+                    cfg.display_hz     ? cfg.display_hz     : DISPLAY_DEFAULT_HZ);
+                if (derr) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", derr); return 0; }
+            }
             if (json_get_bool(body, L"testMode", &bv)) cfg.test_mode = bv;
             if (json_get_bool(body, L"sshEnabled", &bv)) cfg.ssh_enabled = bv;
             if (json_get_bool(body, L"sshDeployKey", &bv)) cfg.ssh_deploy_key = bv;
@@ -751,6 +767,23 @@ static int handle_request(PHTTP_REQUEST req)
                     if (iv < 0 || iv > 3) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal)"); return 0; }
                     hr = asb_vm_set_network(vm, iv);
                 }
+                {
+                    /* Display mode: any subset of displayWidth/displayHeight/displayHz (+
+                       displayModeList); unspecified fields keep their current values. */
+                    int dw = 0, dh = 0, dhz = 0, dlist = -1; BOOL any = FALSE, bv = FALSE;
+                    if (json_get_int(body, L"displayWidth", &dw))  any = TRUE;
+                    if (json_get_int(body, L"displayHeight", &dh)) any = TRUE;
+                    if (json_get_int(body, L"displayHz", &dhz))    any = TRUE;
+                    if (json_get_bool(body, L"displayModeList", &bv)) { dlist = bv ? 1 : 0; any = TRUE; }
+                    if (any) {
+                        const char *derr = asb_display_mode_validate(
+                            dw  ? dw  : asb_vm_display_width(vm),
+                            dh  ? dh  : asb_vm_display_height(vm),
+                            dhz ? dhz : asb_vm_display_hz(vm));
+                        if (derr) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", derr); return 0; }
+                        hr = asb_vm_set_display(vm, dw, dh, dhz, dlist);
+                    }
+                }
                 asb_save();
                 if (SUCCEEDED(hr)) {
                     append_vm_json(buf, sizeof(buf), 0, inst);
@@ -776,6 +809,47 @@ static int handle_request(PHTTP_REQUEST req)
             json_get_int(body, L"branchIndex", &bi);
             json_get_string(body, L"branchName", bname, 128);
             send_hr(req->RequestId, "start", nu, asb_vm_start(vm, si, bi, bname[0] ? bname : NULL));
+            return 0;
+        }
+        /* Live display mode: PUT /v1/vms/{n}/display/mode {displayWidth, displayHeight,
+           displayHz, displayModeList}. Unlike PUT /v1/vms/{n} this is allowed while the
+           VM is RUNNING: the mode is persisted and pushed to the guest agent, which
+           reconfigures + restarts the guest display driver; the display window follows
+           the next frame header. GET returns the configured mode. */
+        if (wcscmp(sub, L"display/mode") == 0) {
+            char b[200];
+            if (verb == HttpVerbPUT || verb == HttpVerbPOST) {
+                wchar_t body[512]; int dw = 0, dh = 0, dhz = 0, dlist = -1; BOOL bv2 = FALSE;
+                const char *derr; HRESULT dhr;
+                BOOL any = FALSE;
+                body_to_wide(req, body, 512);
+                if (json_get_int(body, L"displayWidth", &dw))  any = TRUE;
+                if (json_get_int(body, L"displayHeight", &dh)) any = TRUE;
+                if (json_get_int(body, L"displayHz", &dhz))    any = TRUE;
+                if (json_get_bool(body, L"displayModeList", &bv2)) { dlist = bv2 ? 1 : 0; any = TRUE; }
+                if (!any) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "body must set at least one of displayWidth, displayHeight, displayHz, displayModeList");
+                    return 0;
+                }
+                derr = asb_display_mode_validate(dw ? dw : asb_vm_display_width(vm),
+                                                 dh ? dh : asb_vm_display_height(vm),
+                                                 dhz ? dhz : asb_vm_display_hz(vm));
+                if (derr) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", derr); return 0; }
+                dhr = asb_vm_set_display(vm, dw, dh, dhz, dlist);
+                if (FAILED(dhr)) { send_hr(req->RequestId, "displayMode", nu, dhr); return 0; }
+            } else if (verb != HttpVerbGET) {
+                send_err(req->RequestId, 405, "Method Not Allowed", "method",
+                         "use GET to read the display mode, PUT to change it");
+                return 0;
+            }
+            sprintf_s(b, sizeof(b),
+                      "{\"displayWidth\":%d,\"displayHeight\":%d,\"displayHz\":%d,"
+                      "\"displayModeList\":%s,\"applied\":%s}",
+                      asb_vm_display_width(vm), asb_vm_display_height(vm), asb_vm_display_hz(vm),
+                      asb_vm_display_mode_list(vm) ? "true" : "false",
+                      (asb_vm_is_running(vm) && asb_vm_agent_online(vm)) ? "\"live\"" : "\"next_boot\"");
+            send_json(req->RequestId, 200, "OK", b);
             return 0;
         }
         if (verb == HttpVerbPOST && wcscmp(sub, L"shutdown") == 0)

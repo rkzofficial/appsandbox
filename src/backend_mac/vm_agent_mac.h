@@ -46,6 +46,12 @@ typedef void (^VmAgentIddStatus)(BOOL ready);
  * onSshStateChange. */
 @property (nonatomic, assign)             BOOL sshEnabled;
 
+/* Set before start (and updated on a live change): the tagged
+ * "set_display_mode:<w>x<h>@<hz>:<list>" command sent right after "hello" so
+ * the Windows guest's display driver runs the VM's configured mode (the agent
+ * only restarts the driver when the stored mode differs). nil = don't send. */
+@property (nonatomic, copy, nullable)     NSString *displayModeCommand;
+
 /* Fires on main queue when the guest-reported ssh state changes
  * (synchronous reply to ssh_enable + any async ssh_ready/ssh_failed). */
 @property (nonatomic, copy, nullable)     VmAgentSshStateChange onSshStateChange;

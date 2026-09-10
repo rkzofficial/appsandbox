@@ -125,6 +125,19 @@
         self.keyDeploySent = NO;   /* re-attempt deploy on each (re)connection until it lands */
         [self setOnlineOnMain:YES];
 
+        /* Sync the guest display mode with the VM's setting (Windows guest / VDD).
+           Tagged so an "error:unknown" from an older agent is consumed here. */
+        NSString *dmCmd = self.displayModeCommand;
+        if (dmCmd.length) {
+            NSString *prefix = [NSString stringWithFormat:@"%u:", ++_cmdSeq];
+            NSString *tagged = [NSString stringWithFormat:@"%@%@", prefix, dmCmd];
+            if ([self sendLine:fd string:tagged] > 0) {
+                NSString *resp = [self readTaggedResponse:fd prefix:prefix];
+                [self logFmt:@"[%@] Display mode sync %@ -> %@", self.vmName,
+                             [dmCmd substringFromIndex:17], resp ?: @"(no reply)"];
+            }
+        }
+
         /* Request SSH bring-up if configured. Matches Windows vm_agent.c. */
         if (self.sshEnabled) {
             NSString *prefix = [NSString stringWithFormat:@"%u:", ++_cmdSeq];
@@ -320,6 +333,11 @@
         /* Format: "ip:<iface>:<addr>" — reported by the agent on connect
          * so the user can SSH into the VM without guessing. */
         [self logFmt:@"[%@] IP %s", self.vmName, line + 3];
+        return;
+    }
+    if (strncmp(line, "display_mode:", 13) == 0) {
+        /* Guest reports its display driver's stored mode ("<w>x<h>@<hz>:<list>"). */
+        [self logFmt:@"[%@] Display mode: %s", self.vmName, line + 13];
         return;
     }
     if (strncmp(line, "idd_status:", 11) == 0) {

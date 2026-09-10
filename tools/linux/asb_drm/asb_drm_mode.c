@@ -20,6 +20,7 @@
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_vblank.h>
+#include <linux/math64.h>
 
 #include "asb_drm.h"
 
@@ -67,6 +68,24 @@ static void asb_crtc_disable_vblank(struct drm_crtc *crtc)
 static void asb_crtc_atomic_enable(struct drm_crtc *crtc,
                                    struct drm_atomic_state *state)
 {
+	struct asb_device *asb = crtc_to_asb(crtc);
+	const struct drm_display_mode *mode = &crtc->state->adjusted_mode;
+	int hz = drm_mode_vrefresh(mode);
+
+	/* Pace vblank at the refresh rate of the mode actually committed (the
+	 * guest may pick a non-preferred mode from the list), not the module
+	 * parameter. Use the exact pixel-clock-derived period when available so
+	 * a 240 Hz mode ticks at 4.1667 ms rather than an integer-rounded value. */
+	if (mode->clock > 0 && mode->htotal > 0 && mode->vtotal > 0) {
+		/* period_ns = htotal*vtotal / (clock_kHz*1000) * 1e9 = htotal*vtotal*1e6 / clock_kHz.
+		 * Keep the divisor in 32 bits (div_u64 takes a u32): clock is kHz, so it
+		 * fits for any mode; the dividend stays < 2^63 even for 8K totals. */
+		u64 ns = (u64)mode->htotal * (u64)mode->vtotal * 1000000ULL;
+		asb->vblank_period = ns_to_ktime(div_u64(ns, (u32)mode->clock));
+	} else if (hz > 0) {
+		asb->vblank_period = ns_to_ktime(NSEC_PER_SEC / hz);
+	}
+
 	drm_crtc_vblank_on(crtc);
 }
 
