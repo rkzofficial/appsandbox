@@ -133,7 +133,6 @@ static ssize_t send_all(int fd, const void *buf, size_t len)
 struct capture_ctx {
     int fd;
     uint32_t fb_id_last;
-    uint32_t crtc_id;    /* CRTC the primary plane scans out from (for the refresh rate) */
     uint32_t width;
     uint32_t height;
     uint32_t stride;
@@ -252,7 +251,6 @@ static int drm_acquire_fb(struct capture_ctx *c)
 
         drm_release_fb(c);
         c->fb_id_last = fb_id;
-        c->crtc_id = crtc_id;
         c->refresh = crtc_refresh(c->fd, crtc_id);
         c->width  = width;
         c->height = height;

@@ -117,13 +117,15 @@ static int drm_query_active_mode(int *w, int *h)
     return -1;
 }
 
-static void refresh_frame_size(void)
+/* Re-read the committed mode; returns 1 if the frame size changed, else 0. */
+static int refresh_frame_size(void)
 {
     int w = 0, h = 0;
-    if (drm_query_active_mode(&w, &h) == 0 && (w != g_frame_w || h != g_frame_h)) {
-        g_frame_w = w;
-        g_frame_h = h;
-    }
+    if (drm_query_active_mode(&w, &h) != 0) return 0;
+    if (w == g_frame_w && h == g_frame_h) return 0;
+    g_frame_w = w;
+    g_frame_h = h;
+    return 1;
 }
 
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
@@ -377,7 +379,7 @@ static void serve(int client_fd, int ui_fd)
     time_t last_mode_check;
 
     /* Map host coordinates against the mode the compositor is really running. */
-    refresh_frame_size();
+    (void)refresh_frame_size();
     last_mode_check = time(NULL);
     in_log("frame size %dx%d", g_frame_w, g_frame_h);
 
@@ -392,9 +394,7 @@ static void serve(int client_fd, int ui_fd)
         struct input_packet pkt;
         time_t now = time(NULL);
         if (now - last_mode_check >= 2) {   /* cheap: a handful of ioctls, at most every 2 s (checked per packet) */
-            int ow = g_frame_w, oh = g_frame_h;
-            refresh_frame_size();
-            if (ow != g_frame_w || oh != g_frame_h)
+            if (refresh_frame_size())
                 in_log("frame size changed to %dx%d", g_frame_w, g_frame_h);
             last_mode_check = now;
         }

@@ -50,6 +50,5 @@ BOOL vm_agent_ping(VmInstance *instance);
    it only rewrites its driver config + restarts the display driver when the mode
    differs) and by asb_vm_set_display for a live change. */
 void vm_agent_display_mode_command(const VmInstance *instance, char *buf, int buf_size);
-#define vm_display_mode_command vm_agent_display_mode_command
 
 #endif /* VM_AGENT_H */

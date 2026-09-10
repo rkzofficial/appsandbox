@@ -597,7 +597,6 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
        we have a valid frame in the staging texture for resend on idle. */
     BOOL bHasFrame = FALSE;
     BOOL bSentFullFrame = FALSE;   /* TRUE after first full frame sent to current client */
-    UINT cachedRowPitch = proc->stride;
 
 
     /* Main frame acquisition loop */
@@ -751,7 +750,6 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                     if (SUCCEEDED(hr))
                     {
                         bHasFrame = TRUE;
-                        cachedRowPitch = mapped.RowPitch;
 
                         if (proc->hClientConn != NULL)
                         {
@@ -990,11 +988,10 @@ static void VddContextInit(VDD_DEVICE_CONTEXT* ctx, WDFDEVICE device)
 
     /* Build the mode table from the registry (default 1920x1080@60). A mode change
        is applied by rewriting the registry and restarting this device (the guest
-       agent does both on the host's request), which re-runs DeviceAdd -> here. */
+       agent does both on the host's request), which re-runs DeviceAdd -> here.
+       The table lives only in the g_Modes globals (the IddCx mode callbacks have
+       no device context to reach it through). */
     VddLoadModes();
-    memcpy(ctx->modes, g_Modes, sizeof(g_Modes));
-    ctx->modeCount     = g_ModeCount;
-    ctx->preferredMode = g_PreferredMode;
 }
 
 static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
@@ -1269,8 +1266,8 @@ NTSTATUS VddMonitorAssignSwapChain(
     /* Create staging texture for CPU readback at the preferred mode's size. The
        frame loop recreates it if the swap chain surfaces turn out to be a
        different size (guest picked another mode from the ModeList table). */
-    proc->width  = ctx->modes[ctx->preferredMode].width;
-    proc->height = ctx->modes[ctx->preferredMode].height;
+    proc->width  = g_Modes[g_PreferredMode].width;
+    proc->height = g_Modes[g_PreferredMode].height;
     proc->stride = proc->width * VDD_BPP;
     VddLog("AssignSwapChain: creating staging texture (%ux%u)...", proc->width, proc->height);
     hr = VddCreateStagingTexture(proc, proc->width, proc->height);

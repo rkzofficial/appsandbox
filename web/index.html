@@ -133,19 +133,7 @@
             <label for="display-mode">Display:</label>
             <div class="form-row">
                 <select id="display-mode" onchange="onDisplayModeChange()" title="Guest display mode (resolution @ refresh rate). Can be changed later, even while the VM is running.">
-                    <option value="1920x1080@60" selected>1920 &times; 1080 @ 60 Hz</option>
-                    <option value="1920x1080@120">1920 &times; 1080 @ 120 Hz</option>
-                    <option value="1920x1080@144">1920 &times; 1080 @ 144 Hz</option>
-                    <option value="1920x1080@240">1920 &times; 1080 @ 240 Hz</option>
-                    <option value="2560x1440@60">2560 &times; 1440 @ 60 Hz</option>
-                    <option value="2560x1440@120">2560 &times; 1440 @ 120 Hz</option>
-                    <option value="2560x1440@144">2560 &times; 1440 @ 144 Hz</option>
-                    <option value="2560x1440@165">2560 &times; 1440 @ 165 Hz</option>
-                    <option value="2560x1440@240">2560 &times; 1440 @ 240 Hz</option>
-                    <option value="3440x1440@144">3440 &times; 1440 @ 144 Hz</option>
-                    <option value="3840x2160@60">3840 &times; 2160 @ 60 Hz</option>
-                    <option value="3840x2160@120">3840 &times; 2160 @ 120 Hz</option>
-                    <option value="custom">Custom&hellip;</option>
+                    <!-- options are filled from DISPLAY_PRESETS by populateDisplayPresets() -->
                 </select>
                 <span id="display-custom" style="display:none">
                     <input type="number" id="display-width" value="2560" min="640" max="7680" step="2" class="input-sm" title="Width (px)"> &times;

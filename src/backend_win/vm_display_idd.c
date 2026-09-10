@@ -1211,8 +1211,6 @@ static BOOL d3d_init(VmDisplayIdd *d)
 {
     DXGI_SWAP_CHAIN_DESC scd;
     D3D_FEATURE_LEVEL feature_level;
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
     D3D11_SAMPLER_DESC sd;
     ID3DBlob *vs_blob = NULL;
     ID3DBlob *ps_blob = NULL;
@@ -1263,20 +1261,13 @@ static BOOL d3d_init(VmDisplayIdd *d)
         d->flip_model = SUCCEEDED(hr);
 
         if (FAILED(hr)) {
+            /* Same description, legacy bitblt: only the buffer count, swap effect
+               and flags differ from the flip-model attempt above. */
             ui_log(L"IDD: flip-model swap chain failed (0x%08X), falling back to bitblt", hr);
             d->allow_tearing = FALSE;
-            ZeroMemory(&scd, sizeof(scd));
-            scd.BufferCount                        = 1;
-            scd.BufferDesc.Width                   = cw;
-            scd.BufferDesc.Height                  = ch;
-            scd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM;
-            scd.BufferDesc.RefreshRate.Numerator   = 0;
-            scd.BufferDesc.RefreshRate.Denominator = 1;
-            scd.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-            scd.OutputWindow                       = d->render_hwnd;
-            scd.SampleDesc.Count                   = 1;
-            scd.Windowed                           = TRUE;
-            scd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
+            scd.BufferCount = 1;
+            scd.SwapEffect  = DXGI_SWAP_EFFECT_DISCARD;
+            scd.Flags       = 0;
 
             hr = D3D11CreateDeviceAndSwapChain(
                 NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
@@ -1312,7 +1303,6 @@ static BOOL d3d_init(VmDisplayIdd *d)
 
     /* Create frame texture (dynamic, CPU-writable) at the current frame size.
        Recreated by d3d_render_frame whenever the guest changes mode. */
-    (void)td; (void)srv_desc;
     if (!d3d_create_frame_texture(d, d->frame_width, d->frame_height))
         return FALSE;
 

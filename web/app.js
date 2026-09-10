@@ -450,6 +450,21 @@ function displayModeValid(m) {
            m.w % 2 === 0 && m.h % 2 === 0 && m.hz >= 24 && m.hz <= 500;
 }
 
+/* Fill the create-form preset dropdown from DISPLAY_PRESETS so the list is
+   defined once (index.html carries only the Custom entry). */
+function populateDisplayPresets() {
+    var sel = document.getElementById('display-mode');
+    if (!sel) return;
+    var html = '';
+    for (var i = 0; i < DISPLAY_PRESETS.length; i++) {
+        var m = parseDisplayMode(DISPLAY_PRESETS[i]);
+        html += '<option value="' + DISPLAY_PRESETS[i] + '">' + formatDisplayMode(m.w, m.h, m.hz) + '</option>';
+    }
+    sel.innerHTML = html + '<option value="custom">Custom\u2026</option>';
+    sel.value = '1920x1080@60';
+}
+populateDisplayPresets();
+
 function onDisplayModeChange() {
     var custom = document.getElementById('display-mode').value === 'custom';
     document.getElementById('display-custom').style.display = custom ? '' : 'none';
@@ -477,6 +492,7 @@ function gatherConfig() {
     /* Same ISO-picker path for Windows and Linux. The cloud-image
        Linux-version dropdown is dormant (see applyOsTypeUI). */
     var imagePath = document.getElementById('image-path').value.trim();
+    var displayMode = gatherDisplayMode();
     return {
         name:        document.getElementById('vm-name').value.trim(),
         osType:      osType,
@@ -487,9 +503,9 @@ function gatherConfig() {
         cpuCores:    parseInt(document.getElementById('cpu-cores').value) || 8,
         gpuMode:     parseInt(document.getElementById('gpu-mode').value),
         networkMode: parseInt(document.getElementById('net-mode').value),
-        displayWidth:  gatherDisplayMode().w,
-        displayHeight: gatherDisplayMode().h,
-        displayHz:     gatherDisplayMode().hz,
+        displayWidth:  displayMode.w,
+        displayHeight: displayMode.h,
+        displayHz:     displayMode.hz,
         displayModeList: document.getElementById('display-mode-list').checked,
         netAdapter:  document.getElementById('net-adapter').value,
         adminUser:   document.getElementById('admin-user').value.trim(),

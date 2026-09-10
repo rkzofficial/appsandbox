@@ -386,12 +386,6 @@ static NSCursor *buildGuestCursor(AsbCursor *cur, double scale)
     volatile int      _stop;
 }
 
-- (instancetype)initWithName:(NSString *)name
-                   transport:(AsbIvshmemTransport *)transport
-{
-    return [self initWithName:name transport:transport displayWidth:0 displayHeight:0];
-}
-
 /* Content size (points) for a guest frame of w x h pixels: 1:1 in points when it fits the
    main screen's visible frame, else shrunk (aspect preserved). */
 static NSSize idd_fit_size(uint32_t w, uint32_t h)

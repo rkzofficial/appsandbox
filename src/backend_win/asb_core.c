@@ -33,6 +33,24 @@ static void display_mode_defaults(int *w, int *h, int *hz)
     if (*h  <= 0) *h  = DISPLAY_DEFAULT_HEIGHT;
     if (*hz <= 0) *hz = DISPLAY_DEFAULT_HZ;
 }
+
+/* VmConfig and VmInstance carry the same display-mode fields and hcs_vm.c does not
+   copy them, so the create and start paths move them with these. */
+static void display_cfg_to_inst(VmInstance *inst, const VmConfig *cfg)
+{
+    inst->display_width     = cfg->display_width;
+    inst->display_height    = cfg->display_height;
+    inst->display_hz        = cfg->display_hz;
+    inst->display_mode_list = cfg->display_mode_list;
+}
+
+static void display_inst_to_cfg(VmConfig *cfg, const VmInstance *inst)
+{
+    cfg->display_width     = inst->display_width;
+    cfg->display_height    = inst->display_height;
+    cfg->display_hz        = inst->display_hz;
+    cfg->display_mode_list = inst->display_mode_list;
+}
 #pragma comment(lib, "virtdisk.lib")
 
 /* ---- DLL module handle (for locating iso-patch.exe, resources, etc.) ---- */
@@ -2843,10 +2861,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             wcscpy_s(inst->gpu_name, 256, cfg.gpu_mode == GPU_MIRROR ? L"Try all" :
                                           cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
             inst->network_mode = cfg.network_mode;
-            inst->display_width  = cfg.display_width;
-            inst->display_height = cfg.display_height;
-            inst->display_hz     = cfg.display_hz;
-            inst->display_mode_list = cfg.display_mode_list;
+            display_cfg_to_inst(inst, &cfg);
             inst->is_template = is_template_create;
             inst->test_mode = cfg.test_mode;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
@@ -2916,10 +2931,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             wcscpy_s(inst->gpu_name, 256, cfg.gpu_mode == GPU_MIRROR ? L"Try all" :
                                           cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
             inst->network_mode = cfg.network_mode;
-            inst->display_width  = cfg.display_width;
-            inst->display_height = cfg.display_height;
-            inst->display_hz     = cfg.display_hz;
-            inst->display_mode_list = cfg.display_mode_list;
+            display_cfg_to_inst(inst, &cfg);
             inst->is_template = FALSE;
             inst->test_mode = cfg.test_mode;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
@@ -3087,10 +3099,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
     wcscpy_s(inst->gpu_name, 256, cfg.gpu_mode == GPU_MIRROR ? L"Try all" :
                                   cfg.gpu_mode == GPU_DEFAULT ? L"Default GPU" : L"None");
-    inst->display_width  = cfg.display_width;
-    inst->display_height = cfg.display_height;
-    inst->display_hz     = cfg.display_hz;
-    inst->display_mode_list = cfg.display_mode_list;
+    display_cfg_to_inst(inst, &cfg);
     wcscpy_s(inst->resources_iso_path, MAX_PATH, cfg.resources_iso_path);
     /* hcs_create_vm copies ssh_enabled onto the instance but not the deploy
        fields, so the from-template path sets them here (the ISO and Linux
@@ -3182,10 +3191,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         args->config.cpu_cores = inst->cpu_cores;
         args->config.gpu_mode = inst->gpu_mode;
         args->config.network_mode = inst->network_mode;
-        args->config.display_width  = inst->display_width;
-        args->config.display_height = inst->display_height;
-        args->config.display_hz     = inst->display_hz;
-        args->config.display_mode_list = inst->display_mode_list;
+        display_inst_to_cfg(&args->config, inst);
         args->config.test_mode = inst->test_mode;
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
@@ -3581,7 +3587,7 @@ ASB_API HRESULT asb_vm_set_display(AsbVm vm, int width, int height, int hz, int 
        restart takes a few seconds); the agent logs progress back via log: lines. */
     if (g_vms[idx].running && g_vms[idx].agent_online) {
         char cmd[64];
-        vm_display_mode_command(&g_vms[idx], cmd, sizeof(cmd));
+        vm_agent_display_mode_command(&g_vms[idx], cmd, sizeof(cmd));
         vm_agent_send(&g_vms[idx], cmd, NULL, 0, 0);
     }
 

@@ -21,17 +21,12 @@ void vz_vm_set_no_audio(BOOL no_audio);
 @property (nonatomic, strong, readonly) NSString *name;
 @property (nonatomic, copy, nullable) VzVmStateChangeBlock onStateChange;
 
-/* Build a VZVirtualMachineConfiguration from on-disk state for the named VM.
- * Returns a ready-to-start wrapper, or nil on error. */
-+ (nullable VzVm *)loadVmNamed:(NSString *)name
-                         ramMb:(int)ramMb
-                      cpuCores:(int)cpuCores
-                         error:(NSError **)error;
-
-/* Same, with the initial guest display size in pixels (the core passes the VM's
+/* Build a VZVirtualMachineConfiguration from on-disk state for the named VM,
+ * with the initial guest display size in pixels (the core passes the VM's
  * configured mode, defaulting to 2560x1600 for macOS guests; 0 = that default).
  * VZVirtualMachineView.automaticallyReconfiguresDisplay then follows the window,
- * so this is the mode the guest boots with. VZ exposes no refresh rate. */
+ * so this is the mode the guest boots with. VZ exposes no refresh rate.
+ * Returns a ready-to-start wrapper, or nil on error. */
 + (nullable VzVm *)loadVmNamed:(NSString *)name
                          ramMb:(int)ramMb
                       cpuCores:(int)cpuCores

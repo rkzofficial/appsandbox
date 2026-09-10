@@ -142,13 +142,6 @@ static VZMacGraphicsDeviceConfiguration *BuildGraphics(void) {
 + (VzVm *)loadVmNamed:(NSString *)name
                 ramMb:(int)ramMb
              cpuCores:(int)cpuCores
-                error:(NSError **)error {
-    return [self loadVmNamed:name ramMb:ramMb cpuCores:cpuCores displayWidth:0 displayHeight:0 error:error];
-}
-
-+ (VzVm *)loadVmNamed:(NSString *)name
-                ramMb:(int)ramMb
-             cpuCores:(int)cpuCores
          displayWidth:(int)displayWidth
         displayHeight:(int)displayHeight
                 error:(NSError **)error {
